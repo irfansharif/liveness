@@ -1,0 +1,13 @@
+- Want to build a failure detector module
+- The module is intended to be embedded into a server/node component
+- It'll delegate network I/O to the component it's embedded into
+- Internally it'll makes sense of the messages, and will update it's internal
+  state accordingly (similar to etcd/raft)
+- Want this to sit behind an interface, with two different implementations
+  - One implementation would be identical to crdb's existing liveness system
+  - One would be the proposed lightweight alternative
+- Separately from that, we'll want to construct a simulator with various
+  control knobs to induce specific failure modes. The simulator will use both
+  implementations and spit out results (for e.g. how long it takes to converge
+  on failures, what failures are detectable, what aren't). These results will
+  let us evaluate the various implementations.
