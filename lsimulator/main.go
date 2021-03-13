@@ -19,6 +19,7 @@ import (
 	"io/ioutil"
 	"log"
 	"os"
+	"time"
 
 	"github.com/spf13/cobra"
 )
@@ -32,19 +33,20 @@ func newSimulator() *simulator {
 	s := &simulator{}
 	s.log = log.New(os.Stderr, "INFO: ", 0) // used for debug logging (see --quiet)
 	s.cmd = &cobra.Command{
-		Use:     "simulator [command] (flags)",
-		Short:   "Simulator sets up an environment to evaluate failure detectors.",
+		Use:     "lsimulator [command] (flags)",
+		Short:   "lsimulator sets up an environment to evaluate different failure detectors.",
 		Version: "v0.0",
 		Long: `
-Simulator sets up an environment to evaluate failure detectors. It provides
-control knobs to set up various kind of failures and can be configured with
-different failure detector implementations. The results of the simulation are
-printed out at the end for comparative analysis.
+lsimulator sets up an environment to evaluate different failure detectors. It
+provides control knobs to set up various kind of failures and can be configured
+with different failure detector implementations. The results of the simulation
+are printed out at the end for comparative analysis.
 `,
 		RunE: func(cmd *cobra.Command, args []string) error {
 			nodes := mustGetIntFlag(cmd, "nodes")
 			fdetector := mustGetStringFlag(cmd, "fdetector")
-			return s.run(nodes, fdetector)
+			duration := mustGetDurationFlag(cmd, "duration")
+			return s.run(nodes, fdetector, duration)
 		},
 		// Disable automatic printing of usage information whenever an error
 		// occurs. We expect the errors to be informative enough.
@@ -60,13 +62,20 @@ printed out at the end for comparative analysis.
 	s.cmd.Flags().BoolVar(&quietVar, "quiet", false, "disable logging")
 	s.cmd.Flags().Int("nodes", 3, "the number of nodes to create")
 	s.cmd.Flags().String("fdetector", "crdb", "the failure detector to use (one of crdb, gossip)")
+	s.cmd.Flags().Duration("duration", time.Minute, "timeout for test")
 	s.cmd.PreRunE = func(cmd *cobra.Command, args []string) error {
 		if quietVar {
 			s.log.SetOutput(ioutil.Discard)
 		}
+
 		fdetector := mustGetStringFlag(cmd, "fdetector")
 		if fdetector != "crdb" && fdetector != "gossip" {
 			return fmt.Errorf("unrecognized failure detector %q, expecting either %q or %q", fdetector, "crdb", "gossip")
+		}
+
+		nodes := mustGetIntFlag(cmd, "nodes")
+		if nodes <= 0 {
+			return fmt.Errorf("unexpected node count: %d, expected greater than zero", nodes)
 		}
 		return nil
 	}
