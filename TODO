@@ -14,4 +14,6 @@
   We probably want to start with making the simulator single threaded, for
   simulation determinism. And make timing all tick based. It's a discrete-event
   simulator.
-- Other names: membership, memberlist, group
+- Other names: membership, memberlist, group. group.Invite, group.Remove. Peer.
+- Implement other membership variants. Start with global Raft? Then with
+localized Raft with set of membership nodes.

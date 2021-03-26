@@ -69,8 +69,8 @@ are printed out at the end for comparative analysis.
 		}
 
 		fdetector := mustGetStringFlag(cmd, "fdetector")
-		if fdetector != "crdb" && fdetector != "gossip" {
-			return fmt.Errorf("unrecognized failure detector %q, expecting either %q or %q", fdetector, "crdb", "gossip")
+		if fdetector != "raft" && fdetector != "dummy" {
+			return fmt.Errorf("unrecognized failure detector %q, expecting either %q or %q", fdetector, "raft", "dummy")
 		}
 
 		nodes := mustGetIntFlag(cmd, "nodes")

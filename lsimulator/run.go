@@ -15,99 +15,165 @@
 package main
 
 import (
+	"context"
 	"fmt"
 	"log"
 	"time"
 
 	"github.com/irfansharif/liveness"
+	"golang.org/x/sync/errgroup"
 )
 
-type cluster struct {
+type network struct {
+	time  int64
 	log   *log.Logger
 	nodes []*node
 }
 
-func (c *cluster) tick() {
-	c.log.Print("ticked")
-	// Transmit the set of outbound messages from each node to the intended
-	// destination.
-	for _, n := range c.nodes {
-		n.tick()
+func (n *network) tick() {
+	n.time += 1
+	if n.time%100 == 0 {
+		n.log.Printf("t=%d: ticked!", n.time)
+	}
+
+	// Process the inbox for all nodes.
+	for _, n := range n.nodes {
+		n.Inbox(n.inbox...)
+		n.inbox = n.inbox[:0]
+	}
+
+	// Tick each node.
+	for _, n := range n.nodes {
+		n.Tick()
+	}
+
+	// Process the outbox for each node.
+	for _, n := range n.nodes {
+		n.network.deliver(n.Outbox()...)
 	}
 }
 
-func (c *cluster) deliver(m msg) {
-	c.nodes[m.to].inbox = append(c.nodes[m.to].inbox, m)
+func (n *network) deliver(msgs ...liveness.Message) {
+	for _, m := range msgs {
+		n.nodes[m.To-1].inbox = append(n.nodes[m.To-1].inbox, m) // IDs are 1-indexed
+	}
 }
 
 type node struct {
-	c   *cluster
 	log *log.Logger
+	*network
 
-	*liveness.Liveness
-	inbox []msg
-}
-
-type msg struct {
-	to, from int
-	content  string
-}
-
-func (n *node) tick() {
-	// Process the set of inbound messages.
-	for _, m := range n.inbox {
-		n.log.Printf("received %q from %d", m.content, m.from)
-
-		lmsg := liveness.Message{
-			To: liveness.ID(m.to), From: liveness.ID(m.from),
-			Content: m.content,
-		}
-		n.Inbox(lmsg)
-	}
-	n.inbox = n.inbox[:0]
-
-	n.Tick()
-
-	// Deliver the set of outbound messages.
-	for _, lmsg := range n.Outbox() {
-		m := msg{
-			to:      int(lmsg.To),
-			from:    int(lmsg.From),
-			content: lmsg.Content,
-		}
-		n.c.deliver(m)
-	}
+	liveness.Liveness
+	inbox []liveness.Message
 }
 
 func (s *simulator) run(nodes int, fdetector string, duration time.Duration) error {
 	s.log.Printf("running with %d nodes, using %s; simulating %s", nodes, fdetector, duration)
 
-	c := &cluster{}
-	c.log = log.New(s.log.Writer(), "CLUS: ", 0)
-	for i := 0; i < nodes; i++ {
-		n := &node{
-			c:        c,
-			Liveness: liveness.New(liveness.WithSelf(liveness.ID(i))),
-		}
-		n.log = log.New(s.log.Writer(), fmt.Sprintf("N%03d: ", i), 0)
-		c.nodes = append(c.nodes, n)
+	n := &network{
+		log: log.New(s.log.Writer(), "NETW: ", 0),
 	}
 
-	// Create a fully connected network of nodes.
-	for _, n := range c.nodes {
-		for _, m := range c.nodes {
-			if n.ID() == m.ID() {
+	for i := 1; i <= nodes; i++ {
+		n := &node{
+			log:     log.New(s.log.Writer(), fmt.Sprintf("N%03d: ", i), 0),
+			network: n,
+			Liveness: liveness.New(
+				liveness.WithID(liveness.ID(i)),
+				liveness.WithSeed(liveness.ID(1)),
+				liveness.WithImpl(fdetector),
+			),
+		}
+		n.nodes = append(n.nodes, n)
+	}
+
+	// Use an errgroup with a cancellable context to simulate until either
+	// (a) the "program" has finished executing, or
+	// (b) we've run out of time to simulate.
+	ctx, cancel := context.WithCancel(context.Background())
+	g, ctx := errgroup.WithContext(ctx)
+
+	g.Go(func() error { // the "program"
+		defer cancel()
+
+		n1 := n.nodes[0] // add all nodes to n1 (works as long as we're adding to an already initialized node)
+		for _, nX := range n.nodes[1:] {
+			if err := n1.Add(ctx, nX.ID()); err != nil {
+				return err
+			}
+		}
+
+		var members []liveness.ID
+		for {
+			if ms := n1.Members(); len(ms) == nodes {
+				members = ms
+				break
+			}
+		}
+		n.log.Printf("N%03d: members: %s", n1.ID(), members)
+
+		for {
+			select {
+			case <-ctx.Done():
+				return ctx.Err()
+			default:
+			}
+
+			if err := func() error {
+				for _, nX := range n.nodes[1:] {
+					membersFromElsewhere := nX.Members()
+					if len(membersFromElsewhere) != len(members) {
+						return fmt.Errorf("mismatched view of membership between N%03d and N%03d; expected %d members, got %d",
+							n1.ID(), nX.ID(), len(members), len(membersFromElsewhere))
+					}
+					for i := range membersFromElsewhere {
+						if membersFromElsewhere[i] != members[i] {
+							return fmt.Errorf("mismatched view of membership between N%03d and N%03d; expected %s got %s",
+								n1.ID(), nX.ID(), members, membersFromElsewhere)
+						}
+					}
+				}
+				return nil
+			}(); err != nil {
+				n.log.Printf("waiting: %s", err)
+				time.Sleep(10 * time.Millisecond)
 				continue
 			}
 
-			n.Add(m.ID())
+			break
 		}
-	}
 
-	// Seed the cluster with the first message.
-	c.deliver(msg{to: 0, from: 0, content: "pong"})
-	for tick := 0; tick < int(duration.Seconds()); tick++ {
-		c.tick()
+		for _, member := range members {
+			live, _ := n1.Live(member)
+			n.log.Printf("    N%03d: member=%s: live=%t", n1.ID(), member, live)
+		}
+		n.log.Printf("t=%d: done!", n.time)
+		return nil
+	})
+
+	g.Go(func() error { // the simulation runner
+		defer cancel()
+
+		const dilation int64 = 1
+		numTicks := duration.Milliseconds() / dilation
+		ticker := time.NewTicker(time.Duration(dilation) * time.Millisecond)
+		defer ticker.Stop()
+
+		for {
+			select {
+			case <-ticker.C:
+				n.tick()
+				if n.time == numTicks {
+					return nil
+				}
+			case <-ctx.Done():
+				return ctx.Err()
+			}
+		}
+	})
+
+	if err := g.Wait(); err != nil && err != context.Canceled {
+		return err
 	}
 	return nil
 }
