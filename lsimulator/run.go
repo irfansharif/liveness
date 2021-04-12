@@ -24,6 +24,9 @@ import (
 	"golang.org/x/sync/errgroup"
 )
 
+// TODO(irfansharif): It'd be cool to generate a gif-like form of the
+// simulation, similar to Spencer's gossipsim.
+
 type network struct {
 	time  int64
 	log   *log.Logger
@@ -75,14 +78,17 @@ func (s *simulator) run(nodes int, fdetector string, duration time.Duration) err
 	}
 
 	for i := 1; i <= nodes; i++ {
+		var opts []liveness.Option
+		opts = append(opts, liveness.WithID(liveness.ID(i)))
+		opts = append(opts, liveness.WithImpl(fdetector))
+		if i == 1 {
+			opts = append(opts, liveness.WithBootstrap())
+		}
+
 		n := &node{
-			log:     log.New(s.log.Writer(), fmt.Sprintf("N%03d: ", i), 0),
-			network: n,
-			Liveness: liveness.New(
-				liveness.WithID(liveness.ID(i)),
-				liveness.WithSeed(liveness.ID(1)),
-				liveness.WithImpl(fdetector),
-			),
+			log:      log.New(s.log.Writer(), fmt.Sprintf("N%03d: ", i), 0),
+			network:  n,
+			Liveness: liveness.New(opts...),
 		}
 		n.nodes = append(n.nodes, n)
 	}
@@ -112,6 +118,7 @@ func (s *simulator) run(nodes int, fdetector string, duration time.Duration) err
 		}
 		n.log.Printf("N%03d: members: %s", n1.ID(), members)
 
+		// Loop until the membership view has settled down across all nodes.
 		for {
 			select {
 			case <-ctx.Done():
