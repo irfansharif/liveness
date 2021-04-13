@@ -15,13 +15,13 @@
 package liveness
 
 import (
-	"bytes"
 	"context"
+	"encoding/json"
 	"fmt"
 	"io/ioutil"
 	"log"
+	"math"
 	"sort"
-	"strconv"
 	"sync"
 	"time"
 
@@ -34,12 +34,13 @@ type raftImpl struct {
 
 	mu struct {
 		sync.Mutex
-		members map[ID]bool // member: liveness
+		members map[ID]time.Time // member: expiration ts
 		inbox   []Message
 		outbox  []Message
 		closed  bool
 
 		raftReady []raft.Ready
+		ticker    uint64
 	}
 
 	raft struct {
@@ -47,6 +48,7 @@ type raftImpl struct {
 		storage *raft.MemoryStorage
 	}
 
+	workCh  chan struct{}
 	closeCh chan struct{}
 }
 
@@ -66,8 +68,11 @@ func (r *raftImpl) Live(member ID) (live, found bool) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 
-	live, found = r.mu.members[member]
-	return live, found
+	exp, found := r.mu.members[member]
+	now := time.Now()
+	// XXX: This timing betrays our promise of not using timers underneath. We
+	// should be able to just use tickers still.
+	return now.Before(exp), found
 }
 
 func (r *raftImpl) Members() []ID {
@@ -89,9 +94,38 @@ func (r *raftImpl) Members() []ID {
 // is responsible for calling it periodically.
 //
 // TODO(irfansharif): Implement raft snapshots.
+// TODO(irfansharif): Implement liveness level heartbeats. Maintain an internal
+// ticker, and modulo some constant, propose a heartbeat through raft, so all
+// members learn about it. Is that right? A stale member up to date only with
+// some stale command log will view health at a snapshot in time. What does CRDB
+// do? It sends liveness heartbeats to the leader, and the leader serializes
+// timestamps, and liveness is assessed with respect to expiration timestamps on
+// those proposals + current time. So we'll need HLC clocks, but that's
+// something the simulator can elide. This timestamp business is annoying. Need
+// to look at what CRDB does. Well, it uses KV, so has access to the CPut
+// abstraction. Each node writes to it's own key (in some scannable keyspace),
+// and to get the up-to-date view of things, that keyspace can be read from.
+// Periodically that keyspace is read from to update each node's in-memory cache
+// of liveness. Also, CRDB has gossip available to it, and changes to the
+// liveness range are gossiped and make it's way back to all the nodes (thus
+// updating the cache).
+//
+// What's the equivalent here? Each node proposes heartbeats that expire after
+// some duration. Each other node in the system will look at its applied state +
+// the last heartbeat timestamp + current time.
 func (r *raftImpl) Tick() {
 	r.mu.Lock()
 	defer r.mu.Unlock()
+
+	// XXX: We want this to happen every N ticks, what's an appropriate N?
+	r.mu.ticker += 1
+	if r.mu.ticker%100 == 0 {
+		// Only signal the worker/refresh thread if it's waiting to be signalled.
+		select {
+		case r.workCh <- struct{}{}:
+		default:
+		}
+	}
 
 	// Step through all received messages.
 	for _, msg := range r.mu.inbox {
@@ -127,7 +161,8 @@ func (r *raftImpl) Tick() {
 		for _, entry := range rd.CommittedEntries {
 			switch entry.Type {
 			case raftpb.EntryNormal:
-				if err := r.processEntryLocked(entry); err != nil {
+				if err := r.applyEntryLocked(entry); err != nil {
+					log.Fatal(err, string(entry.Data))
 					r.l.logger.Fatal(err)
 				}
 			case raftpb.EntryConfChange:
@@ -138,7 +173,7 @@ func (r *raftImpl) Tick() {
 				r.raft.node.ApplyConfChange(cc)
 
 				if id := ID(cc.NodeID); id == r.ID() && cc.Type == raftpb.ConfChangeRemoveNode {
-					r.mu.members = make(map[ID]bool) // Drop all members, including ourselves.
+					r.mu.members = make(map[ID]time.Time) // drop all members, including ourselves
 					// TODO(irfansharif): How do we signal to the caller that
 					// we've been removed?
 				}
@@ -224,7 +259,7 @@ func (r *raftImpl) Add(ctx context.Context, member ID) error {
 	if err := r.raft.node.ProposeConfChange(ctx, cc); err != nil {
 		return err
 	}
-	return r.proposeWithRetry(ctx, member, add)
+	return r.proposeWithRetry(ctx, proposal{Member: member, Op: add})
 }
 
 // Remove removes the identified member from the cluster. It retries/reproposes
@@ -235,7 +270,7 @@ func (r *raftImpl) Remove(ctx context.Context, member ID) error {
 	if err := r.raft.node.ProposeConfChange(ctx, cc); err != nil {
 		return err
 	}
-	return r.proposeWithRetry(ctx, member, remove)
+	return r.proposeWithRetry(ctx, proposal{Member: member, Op: remove})
 }
 
 func (r *raftImpl) saveLocked(entries []raftpb.Entry, hs raftpb.HardState, snapshot raftpb.Snapshot) error {
@@ -260,23 +295,35 @@ type operation string
 
 const add operation = "add"
 const remove operation = "remove"
+const refresh operation = "refresh"
 
-func (r *raftImpl) processEntryLocked(entry raftpb.Entry) error {
+type proposal struct {
+	Member ID
+	Op     operation
+	T      time.Time
+}
+
+func (r *raftImpl) applyEntryLocked(entry raftpb.Entry) error {
 	if entry.Data == nil {
 		return nil
 	}
 
-	membership := bytes.SplitN(entry.Data, []byte(":"), 2)
-	id, err := strconv.Atoi(string(membership[0]))
-	if err != nil {
+	var proposal proposal
+	if err := json.Unmarshal(entry.Data, &proposal); err != nil {
 		return err
 	}
 
-	op := operation(membership[1])
-	if op == add {
-		r.mu.members[ID(id)] = true
-	} else {
-		delete(r.mu.members, ID(id))
+	switch proposal.Op {
+	case add:
+		r.mu.members[proposal.Member] = proposal.T
+	case refresh:
+		_, ok := r.mu.members[proposal.Member]
+		if !ok {
+			return fmt.Errorf("refreshing member %s, but not found in applied stated", proposal.Member)
+		}
+		r.mu.members[proposal.Member] = proposal.T
+	case remove:
+		delete(r.mu.members, proposal.Member)
 	}
 	return nil
 }
@@ -301,12 +348,28 @@ func (r *raftImpl) runRaftLoop() {
 	}
 }
 
+func (r *raftImpl) runWorkerLoop() {
+	for {
+		select {
+		case <-r.workCh:
+			exp := time.Now().Add(time.Second) // XXX: What's an appropriate duration?
+			ctx := context.Background()
+			err := r.proposeWithRetry(ctx, proposal{Op: refresh, Member: r.ID(), T: exp})
+			if err != nil {
+				r.l.logger.Fatal(err)
+			}
+		case <-r.closeCh:
+			return
+		}
+	}
+}
+
 // proposeWithRetry submits a raft proposal performing the specified operation
 // on the given member, and re-proposes internally until it's committed.
-func (r *raftImpl) proposeWithRetry(ctx context.Context, member ID, op operation) error {
+func (r *raftImpl) proposeWithRetry(ctx context.Context, pr proposal) error {
 	for {
 		childCtx, _ := context.WithTimeout(ctx, 100*time.Millisecond)
-		err := r.propose(childCtx, member, op)
+		err := r.propose(childCtx, pr)
 		if err != nil && err != context.DeadlineExceeded {
 			return err
 		}
@@ -326,19 +389,27 @@ func (r *raftImpl) proposeWithRetry(ctx context.Context, member ID, op operation
 // propose submits a raft proposal to perform the specified operation on the
 // given member, and returns only when it's both (a) committed, and (b) applied
 // to this module.
-func (r *raftImpl) propose(ctx context.Context, member ID, op operation) error {
-	if err := r.raft.node.Propose(ctx, []byte(fmt.Sprintf("%d:%s", member, op))); err != nil {
+func (r *raftImpl) propose(ctx context.Context, pr proposal) error {
+	payload, err := json.Marshal(pr)
+	if err != nil {
 		return err
 	}
 
+	if err := r.raft.node.Propose(ctx, payload); err != nil {
+		return err
+	}
+
+	if pr.Op == refresh {
+		return nil // for refreshes, we just fire and forget
+	}
 	for {
 		select {
 		case <-ctx.Done():
 			return ctx.Err()
 		default:
 		}
-		_, found := r.Live(member)
-		if op == add && found || op == remove && !found {
+		_, found := r.Live(pr.Member)
+		if pr.Op == add && found || pr.Op == remove && !found {
 			return nil
 		}
 	}
@@ -352,8 +423,9 @@ func startRaftImpl(l *liveness) *raftImpl {
 	r := &raftImpl{
 		l:       l,
 		closeCh: make(chan struct{}),
+		workCh:  make(chan struct{}),
 	}
-	r.mu.members = make(map[ID]bool)
+	r.mu.members = make(map[ID]time.Time)
 	r.mu.outbox = make([]Message, 0)
 	var logger *log.Logger
 	if l.logger != nil {
@@ -362,9 +434,38 @@ func startRaftImpl(l *liveness) *raftImpl {
 		logger.SetFlags(0)
 	} else {
 		logger = log.New(ioutil.Discard, "[raft] ", 0)
+		l.logger = logger
 	}
 
 	r.raft.storage = raft.NewMemoryStorage()
+	if l.fromRaftStorage != nil {
+		// Recover the in-memory storage from persistent snapshot, state and
+		// entries.
+		hs, _, err := l.fromRaftStorage.InitialState()
+		if err != nil {
+			logger.Fatal(err)
+		}
+		if err := r.raft.storage.SetHardState(hs); err != nil {
+			logger.Fatal(err)
+		}
+
+		fi, err := l.fromRaftStorage.FirstIndex()
+		if err != nil {
+			logger.Fatal(err)
+		}
+		li, err := l.fromRaftStorage.LastIndex()
+		if err != nil {
+			logger.Fatal(err)
+		}
+		entries, err := l.fromRaftStorage.Entries(fi, li+1, math.MaxUint64)
+		if err != nil {
+			logger.Fatal(err)
+		}
+		if err := r.raft.storage.Append(entries); err != nil {
+			logger.Fatal(err)
+		}
+	}
+
 	if l.mockRaftNode != nil {
 		r.raft.node = l.mockRaftNode
 		go r.runRaftLoop()
@@ -390,8 +491,7 @@ func startRaftImpl(l *liveness) *raftImpl {
 	// raft group, and each additional node seeding with node 1, proposing
 	// changes to it to get themselves added.
 
-	// XXX: So there are two aspects: membership, and health. Will need to
-	// implement timers and heartbeats for node health.
+	// XXX: So there are two aspects: membership, and health.
 	// XXX: We'll also want to be able to switch out members of the raft group
 	// itself, I think. Though that's a whole another level of complexity that
 	// might not be all that worthwhile? It'll entail simulating movement of the
@@ -407,6 +507,12 @@ func startRaftImpl(l *liveness) *raftImpl {
 	// thing raft is internally doing with its heartbeats. On the one hand,
 	// that's kind of silly. Seems like the thing we'd otherwise be using paxos
 	// for. On the other hand, I'm not familiar with it.
+	//
+	// Actually, in raft heartbeats only go from leader to follower, and then
+	// heartbeat responses. A follower doesn't have the full view of the health
+	// of other followers (liveness in contrast is a lot more egalitarian).
+	// Also, doesn't look like etcd/raft exposes a view into how far back a
+	// follower is, or if it hasn't responded to heartbeat messages in a while.
 	var peers []raft.Peer
 	if l.bootstrap {
 		peers = append(peers, raft.Peer{ID: uint64(l.id)})
@@ -418,11 +524,15 @@ func startRaftImpl(l *liveness) *raftImpl {
 		}); err != nil {
 			logger.Fatal(err)
 		}
+		payload, err := json.Marshal(proposal{Op: add, Member: l.id})
+		if err != nil {
+			logger.Fatal(err)
+		}
 		if err := r.raft.storage.Append([]raftpb.Entry{
 			{
 				Term: 1, Index: 1,
 				Type: raftpb.EntryNormal,
-				Data: []byte(fmt.Sprintf("%d:%s", l.id, add)),
+				Data: payload,
 			},
 		}); err != nil {
 			logger.Fatal(err)
@@ -431,5 +541,7 @@ func startRaftImpl(l *liveness) *raftImpl {
 
 	r.raft.node = raft.StartNode(c, peers)
 	go r.runRaftLoop()
+	go r.runWorkerLoop()
+
 	return r
 }

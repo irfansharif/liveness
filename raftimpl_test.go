@@ -16,7 +16,9 @@ package liveness
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
+	"sync"
 	"testing"
 	"time"
 
@@ -144,9 +146,12 @@ func TestRaftImplTick(t *testing.T) {
 
 	// Feed in a raft.Ready with a committed entry, and ensure Tick applies it
 	// to the in-memory state.
+	payload, err := json.Marshal(proposal{Member: 42, Op: add})
+	assert.NoError(t, err)
+
 	mrn.readyc <- raft.Ready{
 		CommittedEntries: []raftpb.Entry{
-			{Type: raftpb.EntryNormal, Data: []byte(fmt.Sprintf("%d:%s", 42, add))},
+			{Type: raftpb.EntryNormal, Data: payload},
 		},
 	}
 	testutils.SucceedsSoon(t, func() error {
@@ -332,6 +337,300 @@ func TestRaftImplMultipleRemove(t *testing.T) {
 				return nil
 			})
 		})
+	}
+}
+
+func TestRaftImplPartitionedNode(t *testing.T) {
+	defer leaktest.Check(t)()
+
+	const numMembers = 10
+	const bootstrapMember, downMember ID = 1, 1
+
+	n := newNetwork()
+	var bootstrapped Liveness
+	for i := 1; i <= numMembers; i++ {
+		opts := []Option{WithID(ID(i)), WithImpl("raft")}
+		if ID(i) == bootstrapMember {
+			opts = append(opts, WithBootstrap())
+		}
+
+		l := New(opts...) // closed by the network teardown below
+		n.ls = append(n.ls, l)
+		if ID(i) == bootstrapMember {
+			bootstrapped = l
+		}
+	}
+
+	teardown := n.tick(t)
+	defer teardown()
+
+	for _, l := range n.ls {
+		if l.ID() == bootstrapped.ID() {
+			continue
+		}
+		assert.NoError(t, bootstrapped.Add(context.Background(), l.ID()))
+	}
+
+	n.partition(downMember)
+	testutils.SucceedsSoon(t, func() error {
+		for _, l := range n.ls {
+			live, found := l.Live(downMember)
+			if !found {
+				return fmt.Errorf("expected to find liveness status for id=%s", downMember)
+			}
+			if live {
+				return fmt.Errorf("expected to find id=%s as non-live", downMember)
+			}
+		}
+		return nil
+	})
+
+	n.heal(downMember)
+	testutils.SucceedsSoon(t, func() error {
+		for _, l := range n.ls {
+			live, found := l.Live(downMember)
+			if !found {
+				return fmt.Errorf("expected to find liveness status for id=%s", downMember)
+			}
+			if !live {
+				return fmt.Errorf("expected to find id=%s as live", downMember)
+			}
+		}
+		return nil
+	})
+}
+
+func TestRaftImplRestartedNode(t *testing.T) {
+	defer leaktest.Check(t)()
+
+	const numMembers = 10
+	const bootstrapMember, restartedMember ID = 1, 3
+
+	n := newNetwork()
+	var bootstrapped Liveness
+	for i := 1; i <= numMembers; i++ {
+		opts := []Option{WithID(ID(i)), WithImpl("raft")}
+		if ID(i) == bootstrapMember {
+			opts = append(opts, WithBootstrap())
+		}
+
+		l := New(opts...) // closed by the network teardown below
+		n.ls = append(n.ls, l)
+		if ID(i) == bootstrapMember {
+			bootstrapped = l
+		}
+	}
+
+	teardown := n.tick(t)
+	defer teardown()
+
+	for _, l := range n.ls {
+		if l.ID() == bootstrapped.ID() {
+			continue
+		}
+		assert.NoError(t, bootstrapped.Add(context.Background(), l.ID()))
+	}
+
+	n.restart(restartedMember)
+	testutils.SucceedsSoon(t, func() error {
+		for _, l := range n.ls {
+			live, found := l.Live(restartedMember)
+			if !found {
+				return fmt.Errorf("expected to find liveness status for id=%s", restartedMember)
+			}
+			if live {
+				return fmt.Errorf("expected to find id=%s as non-live", restartedMember)
+			}
+		}
+		return nil
+	})
+}
+
+func TestRaftImplRemovePartitionedNode(t *testing.T) {
+	defer leaktest.Check(t)()
+
+	const numMembers = 10
+	const bootstrapMember, removedMember ID = 1, 3
+
+	n := newNetwork()
+	var bootstrapped Liveness
+	for i := 1; i <= numMembers; i++ {
+		opts := []Option{WithID(ID(i)), WithImpl("raft")}
+		if ID(i) == bootstrapMember {
+			opts = append(opts, WithBootstrap())
+		}
+
+		l := New(opts...) // closed by the network teardown below
+		n.ls = append(n.ls, l)
+		if ID(i) == bootstrapMember {
+			bootstrapped = l
+		}
+	}
+
+	teardown := n.tick(t)
+	defer teardown()
+
+	for _, l := range n.ls {
+		if l.ID() == bootstrapped.ID() {
+			continue
+		}
+		assert.NoError(t, bootstrapped.Add(context.Background(), l.ID()))
+	}
+
+	n.stop(removedMember)
+	testutils.SucceedsSoon(t, func() error {
+		for _, l := range n.ls {
+			live, found := l.Live(removedMember)
+			if !found {
+				return fmt.Errorf("expected to find liveness status for id=%s", removedMember)
+			}
+			if live {
+				return fmt.Errorf("expected to find id=%s as non-live", removedMember)
+			}
+		}
+		return nil
+	})
+
+	assert.NoError(t, bootstrapped.Remove(context.Background(), removedMember))
+	testutils.SucceedsSoon(t, func() error {
+		for _, l := range n.ls {
+			if l.ID() == removedMember {
+				continue
+			}
+
+			_, found := l.Live(removedMember)
+			if found {
+				return fmt.Errorf("expected to not find liveness status for id=%s; membership (from %d): %s", removedMember, l.ID(), l.Members())
+			}
+		}
+		return nil
+	})
+
+	n.restart(removedMember)
+
+	testutils.SucceedsSoon(t, func() error {
+		l := n.get(removedMember)
+		if len(l.Members()) != 0 {
+			return fmt.Errorf("expected to find empty membership, found %s", l.Members())
+		}
+		return nil
+	})
+}
+
+func newNetwork() *network {
+	return &network{
+		ls:          make([]Liveness, 0),
+		partitioned: make(map[ID]struct{}),
+		stopped:     make(map[ID]struct{}),
+	}
+}
+
+type network struct {
+	sync.Mutex
+	ls []Liveness
+
+	partitioned map[ID]struct{}
+	stopped     map[ID]struct{}
+}
+
+func (n *network) get(member ID) Liveness {
+	return n.ls[int(member)-1]
+}
+
+func (n *network) stop(member ID) {
+	n.Lock()
+	defer n.Unlock()
+
+	l := n.ls[int(member)-1]
+	l.Close()
+
+	n.stopped[member] = struct{}{}
+}
+
+func (n *network) restart(member ID) {
+	n.Lock()
+	defer n.Unlock()
+
+	old := n.ls[int(member)-1]
+	impl := old.(*liveness).Liveness.(*raftImpl)
+
+	l := New(WithID(member), WithImpl("raft"), withExistingRaftStorage(impl.raft.storage))
+	n.ls[int(member)-1] = l
+	delete(n.stopped, member)
+}
+
+func (n *network) partition(member ID) {
+	n.Lock()
+	defer n.Unlock()
+
+	n.partitioned[member] = struct{}{}
+}
+
+func (n *network) heal(member ID) {
+	n.Lock()
+	defer n.Unlock()
+
+	delete(n.partitioned, member)
+}
+
+func (n *network) tick(t *testing.T) (teardown func() error) {
+	for i, l := range n.ls {
+		if got, exp := l.ID(), ID(i+1); got != exp {
+			t.Fatalf("malformed cluster list; expected ls[%d]:%s got %s", i, exp, got)
+		}
+	}
+
+	// Set up the liveness tickers + message delivery service in a separate
+	// thread.
+	ctx, cancel := context.WithCancel(context.Background())
+	g, ctx := errgroup.WithContext(ctx)
+	g.Go(func() error {
+		for {
+			select {
+			case <-ctx.Done():
+				return ctx.Err()
+			default:
+			}
+
+			n.Lock()
+			for _, l := range n.ls {
+				if _, ok := n.partitioned[l.ID()]; ok {
+					continue // don't bother processing the outbox
+				}
+
+				for _, msg := range l.Outbox() {
+					if _, ok := n.partitioned[msg.To]; ok {
+						continue // don't bother delivering to it
+					}
+
+					n.ls[msg.To-1].Inbox(msg)
+				}
+			}
+			n.Unlock()
+
+			for _, l := range n.ls {
+				if _, ok := n.stopped[l.ID()]; ok {
+					continue // don't bother ticking this node
+				}
+				l.Tick()
+			}
+
+			time.Sleep(10 * time.Millisecond)
+		}
+	})
+
+	return func() error {
+		cancel()
+		if err := g.Wait(); err != nil && err != context.Canceled {
+			return err
+		}
+
+		n.Lock()
+		for _, l := range n.ls {
+			l.Close()
+		}
+		n.Unlock()
+		return nil
 	}
 }
 

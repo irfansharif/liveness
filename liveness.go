@@ -100,7 +100,8 @@ type liveness struct {
 	logger    *log.Logger
 	bootstrap bool
 
-	mockRaftNode raft.Node
+	mockRaftNode    raft.Node
+	fromRaftStorage raft.Storage
 }
 
 // Option is used to configure a new liveness module.
@@ -169,5 +170,11 @@ func WithImpl(impl string) Option {
 func withMockRaftNode(mock raft.Node) Option {
 	return func(l *liveness) {
 		l.mockRaftNode = mock
+	}
+}
+
+func withExistingRaftStorage(existing raft.Storage) Option {
+	return func(l *liveness) {
+		l.fromRaftStorage = existing
 	}
 }
