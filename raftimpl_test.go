@@ -171,18 +171,19 @@ func TestRaftImplTick(t *testing.T) {
 func TestRaftImplSingleMembership(t *testing.T) {
 	defer leaktest.Check(t)()
 
+	n := newNetwork()
 	id := ID(1)
 	l := New(
 		WithID(id),
 		WithImpl("raft"),
 		WithBootstrap(),
 	)
-	defer l.Close()
+	n.ls = append(n.ls, l)
 
 	// Sanity check our ID.
 	assert.Equal(t, id, l.ID())
 
-	teardown := tick(t, l)
+	teardown := n.tick(t)
 	defer teardown()
 
 	// Check that we appear as live to ourself.
@@ -431,6 +432,7 @@ func TestRaftImplRestartedNode(t *testing.T) {
 		assert.NoError(t, bootstrapped.Add(context.Background(), l.ID()))
 	}
 
+	n.stop(restartedMember)
 	n.restart(restartedMember)
 	testutils.SucceedsSoon(t, func() error {
 		for _, l := range n.ls {
@@ -517,6 +519,79 @@ func TestRaftImplRemovePartitionedNode(t *testing.T) {
 	})
 }
 
+// TestRaftImplMembersAppearNonLiveAfterQuickRestart checks to see that after a
+// node-restart, all peer nodes appear non-live to the just-restarted node until
+// they've individually refreshed once again.
+func TestRaftImplMembersAppearNonLiveAfterQuickRestart(t *testing.T) {
+	defer leaktest.Check(t)
+
+	const numMembers = 2
+	const bootstrapMember, stoppedMember ID = 1, 2
+
+	n := newNetwork()
+	var bootstrapped Liveness
+	for i := 1; i <= numMembers; i++ {
+		opts := []Option{WithID(ID(i)), WithImpl("raft")}
+		if ID(i) == bootstrapMember {
+			opts = append(opts, WithBootstrap())
+		}
+
+		l := New(opts...) // closed by the network teardown below
+		n.ls = append(n.ls, l)
+		if ID(i) == bootstrapMember {
+			bootstrapped = l
+		}
+	}
+
+	teardown := n.tick(t)
+	defer teardown()
+
+	for _, l := range n.ls {
+		if l.ID() == bootstrapped.ID() {
+			continue
+		}
+		assert.NoError(t, bootstrapped.Add(context.Background(), l.ID()))
+	}
+
+	testutils.SucceedsSoon(t, func() error {
+		live, found := n.get(stoppedMember).Live(bootstrapMember)
+		if !found {
+			return fmt.Errorf("expected to find liveness status for id=%s", bootstrapMember)
+		}
+		if !live {
+			return fmt.Errorf("expected to find id=%s as live", bootstrapMember)
+		}
+		return nil
+	})
+
+	n.stop(bootstrapMember)
+	n.stop(stoppedMember)
+	n.restart(stoppedMember)
+
+	// TODO(irfansharif): This test wants to start off stoppedMember with a
+	// heartbeat increment of inf, else it could be testing bootstrapMember's
+	// heartbeat expiration.
+
+	// live, found := n.get(stoppedMember).Live(bootstrapMember)
+	// if !found {
+	// 	t.Fatalf("expected to find liveness status for id=%s", bootstrapMember)
+	// }
+	// if live {
+	// 	t.Fatalf("expected to find id=%s as non-live", bootstrapMember)
+	// }
+
+	testutils.SucceedsSoon(t, func() error {
+		live, found := n.get(stoppedMember).Live(bootstrapMember)
+		if !found {
+			return fmt.Errorf("expected to find liveness status for id=%s", bootstrapMember)
+		}
+		if live {
+			return fmt.Errorf("expected to find id=%s as non-live", bootstrapMember)
+		}
+		return nil
+	})
+}
+
 func newNetwork() *network {
 	return &network{
 		ls:          make([]Liveness, 0),
@@ -537,12 +612,13 @@ func (n *network) get(member ID) Liveness {
 	return n.ls[int(member)-1]
 }
 
+func (n *network) set(member ID, l Liveness) {
+	n.ls[int(member)-1] = l
+}
+
 func (n *network) stop(member ID) {
 	n.Lock()
 	defer n.Unlock()
-
-	l := n.ls[int(member)-1]
-	l.Close()
 
 	n.stopped[member] = struct{}{}
 }
@@ -551,11 +627,16 @@ func (n *network) restart(member ID) {
 	n.Lock()
 	defer n.Unlock()
 
-	old := n.ls[int(member)-1]
+	old := n.get(member)
+	old.Close()
 	impl := old.(*liveness).Liveness.(*raftImpl)
+	l := New(
+		WithID(member),
+		WithImpl("raft"),
+		WithStorage(impl.raft.storage),
+	)
+	n.set(member, l)
 
-	l := New(WithID(member), WithImpl("raft"), withExistingRaftStorage(impl.raft.storage))
-	n.ls[int(member)-1] = l
 	delete(n.stopped, member)
 }
 

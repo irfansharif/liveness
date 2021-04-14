@@ -29,12 +29,20 @@ import (
 	"github.com/etcd-io/etcd/raft"
 )
 
+// TODO(irfansharif): It's unclear what this constant should be. It's coupled to
+// the ticker duration the caller decides to use, so should probably be
+// configurable? If ticker duration is 10ms, heartbeatIncrement=100 is a
+// heartbeat extension of 1s, with heartbeats happening every 0.5s.
+
+const heartbeatIncrement = 100
+
 type raftImpl struct {
-	l *liveness
+	l   *liveness
+	log *log.Logger
 
 	mu struct {
 		sync.Mutex
-		members map[ID]time.Time // member: expiration ts
+		members map[ID]uint64 // member: ticker expiration
 		inbox   []Message
 		outbox  []Message
 		closed  bool
@@ -48,8 +56,8 @@ type raftImpl struct {
 		storage *raft.MemoryStorage
 	}
 
-	workCh  chan struct{}
-	closeCh chan struct{}
+	heartbeatCh chan struct{}
+	closeCh     chan struct{}
 }
 
 func (r *raftImpl) Close() {
@@ -61,6 +69,7 @@ func (r *raftImpl) Close() {
 	}
 
 	close(r.closeCh)
+	r.raft.node.Stop()
 	r.mu.closed = true
 }
 
@@ -69,10 +78,7 @@ func (r *raftImpl) Live(member ID) (live, found bool) {
 	defer r.mu.Unlock()
 
 	exp, found := r.mu.members[member]
-	now := time.Now()
-	// XXX: This timing betrays our promise of not using timers underneath. We
-	// should be able to just use tickers still.
-	return now.Before(exp), found
+	return r.mu.ticker < exp, found
 }
 
 func (r *raftImpl) Members() []ID {
@@ -94,44 +100,27 @@ func (r *raftImpl) Members() []ID {
 // is responsible for calling it periodically.
 //
 // TODO(irfansharif): Implement raft snapshots.
-// TODO(irfansharif): Implement liveness level heartbeats. Maintain an internal
-// ticker, and modulo some constant, propose a heartbeat through raft, so all
-// members learn about it. Is that right? A stale member up to date only with
-// some stale command log will view health at a snapshot in time. What does CRDB
-// do? It sends liveness heartbeats to the leader, and the leader serializes
-// timestamps, and liveness is assessed with respect to expiration timestamps on
-// those proposals + current time. So we'll need HLC clocks, but that's
-// something the simulator can elide. This timestamp business is annoying. Need
-// to look at what CRDB does. Well, it uses KV, so has access to the CPut
-// abstraction. Each node writes to it's own key (in some scannable keyspace),
-// and to get the up-to-date view of things, that keyspace can be read from.
-// Periodically that keyspace is read from to update each node's in-memory cache
-// of liveness. Also, CRDB has gossip available to it, and changes to the
-// liveness range are gossiped and make it's way back to all the nodes (thus
-// updating the cache).
-//
-// What's the equivalent here? Each node proposes heartbeats that expire after
-// some duration. Each other node in the system will look at its applied state +
-// the last heartbeat timestamp + current time.
 func (r *raftImpl) Tick() {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 
-	// XXX: We want this to happen every N ticks, what's an appropriate N?
-	r.mu.ticker += 1
-	if r.mu.ticker%100 == 0 {
-		// Only signal the worker/refresh thread if it's waiting to be signalled.
+	// We trigger a heartbeat around the halfway point from when we last
+	// heartbeat, to when the heartbeat will no longer be valid.
+	if r.mu.ticker%(heartbeatIncrement/2) == 0 {
+		// Only signal the worker/heartbeat thread if it's waiting to be
+		// signalled.
 		select {
-		case r.workCh <- struct{}{}:
+		case r.heartbeatCh <- struct{}{}:
 		default:
 		}
 	}
+	r.mu.ticker += 1
 
 	// Step through all received messages.
 	for _, msg := range r.mu.inbox {
 		raftmsg := msg.Content.(raftpb.Message)
 		if err := r.raft.node.Step(context.Background(), raftmsg); err != nil {
-			r.l.logger.Fatal(err)
+			r.log.Fatal(err)
 		}
 	}
 
@@ -144,7 +133,7 @@ func (r *raftImpl) Tick() {
 	// Step through all received raft ready messages.
 	for _, rd := range r.mu.raftReady {
 		if err := r.saveLocked(rd.Entries, rd.HardState, rd.Snapshot); err != nil {
-			r.l.logger.Fatal(err)
+			r.log.Fatal(err)
 		}
 
 		// Slate all outgoing raft messages for delivery.
@@ -163,17 +152,17 @@ func (r *raftImpl) Tick() {
 			case raftpb.EntryNormal:
 				if err := r.applyEntryLocked(entry); err != nil {
 					log.Fatal(err, string(entry.Data))
-					r.l.logger.Fatal(err)
+					r.log.Fatal(err)
 				}
 			case raftpb.EntryConfChange:
 				var cc raftpb.ConfChange
 				if err := cc.Unmarshal(entry.Data); err != nil {
-					r.l.logger.Fatal(err)
+					r.log.Fatal(err)
 				}
 				r.raft.node.ApplyConfChange(cc)
 
 				if id := ID(cc.NodeID); id == r.ID() && cc.Type == raftpb.ConfChangeRemoveNode {
-					r.mu.members = make(map[ID]time.Time) // drop all members, including ourselves
+					r.mu.members = make(map[ID]uint64) // drop all members, including ourselves
 					// TODO(irfansharif): How do we signal to the caller that
 					// we've been removed?
 				}
@@ -216,66 +205,32 @@ func (r *raftImpl) ID() ID {
 // Add adds the identified member to the cluster. It retries/reproposes
 // internally, returning only once the member was successfully added.
 func (r *raftImpl) Add(ctx context.Context, member ID) error {
-	// XXX: first check to see that we can propose. if we can, call into
-	// ProposeConfChange, to add it to the raft group then send a proposal
-	// through raft to have each member add this new node to the member.
-	//
-	// does the ordering matter? what if we add a new node, and it's still
-	// unhealthy? maybe we should add as unhealthy, getting it through the
-	// existing consensus group, and only then adding it as a member?
-	// Should we vary this to have the nodes propose themselves? We could have
-	// the node being joined through propose the actual raft membership change.
-	// And once the joining node finds out about it (because it's own raft
-	// module tells it so), it can propose itself. But I don't really understand
-	// the point of that, I don't think there would be much. If we want control
-	// over 'initialization', we could have the liveness modules wait until it
-	// hears about it's own addition. When we eventually introduce
-	// timers/heartbeats, we could add the raft member to the raft group, and
-	// then propose a membership at the liveness level except marking it as
-	// unhealthy; counting on the newly added member to heartbeat itself. Does
-	// this let us decouple the addition of the node to the raft group from the
-	// addition of the node at the liveness layer? Maybe not? Wouldn't raft
-	// require heartbeats from that newly-added raft node.
-	// What's a better protocol for it? Send a membership proposal first, which
-	// if accepted, can be taken as signal to add the extra member to the raft
-	// group. Actually, I'm not sure. At some level if the conf-change proposal
-	// goes through, it's the same as the membership proposal going through? The
-	// proposing node needs to find a majority of existing nodes (i.e. excluding
-	// the node being added) accessible. Anyway, I'm not sure if the ordering
-	// matters.
-	//
-	// What happens if only one of these things goes through and then we fail?
-	// Because we're registering nodes based on proposal entries, rather than
-	// conf change entries, it might be the case that the newly added node never
-	// gets to add itself as a liveness-level member? Should we just skip
-	// proposal based membership altogether in favor of piggy-backing on top of
-	// the conf-change mechanism? It's somewhat of a simplification: adding a
-	// member would only need a single raft proposal round.
-	//
-	// We could also hollow out Add, and let it only send a raft proposal, which
-	// if accepted, prompts the caller to then start the other node, and propose
-	// a conf-change? Kind of cockroach does with the join rpc.
+	if _, found := r.Live(member); found {
+		return fmt.Errorf("can't add %d, already exists", member)
+	}
 	cc := raftpb.ConfChange{Type: raftpb.ConfChangeAddNode, NodeID: uint64(member)}
 	if err := r.raft.node.ProposeConfChange(ctx, cc); err != nil {
 		return err
 	}
+	r.log.Printf("proposing to add l=%d", member)
 	return r.proposeWithRetry(ctx, proposal{Member: member, Op: add})
 }
 
 // Remove removes the identified member from the cluster. It retries/reproposes
 // internally, returning only once the member was successfully removed.
 func (r *raftImpl) Remove(ctx context.Context, member ID) error {
-	// XXX: Same questions here around the ordering of these two things.
 	cc := raftpb.ConfChange{Type: raftpb.ConfChangeRemoveNode, NodeID: uint64(member)}
 	if err := r.raft.node.ProposeConfChange(ctx, cc); err != nil {
 		return err
 	}
+
+	r.log.Printf("proposing to remove l=%d", member)
 	return r.proposeWithRetry(ctx, proposal{Member: member, Op: remove})
 }
 
 func (r *raftImpl) saveLocked(entries []raftpb.Entry, hs raftpb.HardState, snapshot raftpb.Snapshot) error {
 	if err := r.raft.storage.Append(entries); err != nil {
-		r.l.logger.Fatal(err)
+		r.log.Fatal(err)
 	}
 
 	if !raft.IsEmptyHardState(hs) {
@@ -295,12 +250,11 @@ type operation string
 
 const add operation = "add"
 const remove operation = "remove"
-const refresh operation = "refresh"
+const heartbeat operation = "heartbeat"
 
 type proposal struct {
-	Member ID
 	Op     operation
-	T      time.Time
+	Member ID
 }
 
 func (r *raftImpl) applyEntryLocked(entry raftpb.Entry) error {
@@ -315,15 +269,76 @@ func (r *raftImpl) applyEntryLocked(entry raftpb.Entry) error {
 
 	switch proposal.Op {
 	case add:
-		r.mu.members[proposal.Member] = proposal.T
-	case refresh:
+		r.mu.members[proposal.Member] = r.mu.ticker - 1 // add the member as non-live, expecting a heartbeat
+		r.log.Printf("added l=%d", proposal.Member)
+	case heartbeat:
 		_, ok := r.mu.members[proposal.Member]
 		if !ok {
-			return fmt.Errorf("refreshing member %s, but not found in applied stated", proposal.Member)
+			// We've received a heartbeat for a member that's no longer part of
+			// peer-list. This can happen if the proposals removing the member
+			// happen concurrently with a heartbeat (raft might re-route
+			// proposals internally). We'll just ignore the heartbeat.
+			r.log.Printf("received heartbeat for l=%d (no longer a member)", proposal.Member)
+			return nil
 		}
-		r.mu.members[proposal.Member] = proposal.T
+
+		// We're applying a heartbeat request. Compute at this node, starting
+		// now, when the heartbeat is set to expire.
+		//
+		// TODO(irfansharif): Do we need the notion of epochs? Do we want a node
+		// to be able to quickly restart and insta-heartbeat without other nodes
+		// finding about it? Probably not, there's no benefit to it, and it's
+		// not what CRDB does. It also opens up the possibility for false
+		// negatives. So what should be done?
+
+		// When applying heartbeat requests it happens from one of two ways:
+		//
+		// 	a. through regular raft replication, while we're live and healthy
+		// 	b. when restarting a node, and reapplying previous entries
+		//
+		// Computing the lease extension ticker count during (a) is fine, but
+		// during (b) is nonsensical. What's to be done? Ideally we'd be able to
+		// distinguish (does etcd/raft let us?), and simply not apply any
+		// heartbeat requests post-restart. We'd then rely on the subsequent
+		// heartbeat from all peers to ascertain health status. Basically
+		// heartbeats should be time bound.
+		//
+		// TODO(irfansharif): Separately, at the start, perhaps we want to wait
+		// out our previous epoch's heartbeat lease (or something) so that other
+		// nodes are able to detect our blip. A "simple" fix: each module can
+		// send out it's first heartbeat request only after the
+		// heartbeatIncrement*2 ticks, so it's guaranteed to appear as failed to
+		// all other nodes.
+		//
+		// In doing "is live" this way (through applied state based on
+		// raft commands, without real timers), a lagging follower will always
+		// have a stale view of liveness. The up-to-date view of liveness will
+		// only appear at the leader node (and up-to-date) followers. In raft,
+		// no single follower is aware that it's lagging behind. So it can't
+		// distinguish between a heartbeat request made "at the same time" and
+		// one made in the past, that it's only now finding out about. We'd have
+		// to go to the leader to retrieve an up-to-date view of liveness.
+		//
+		// To prevent the false positive post-restart, we don't process any
+		// heartbeat requests for the first heartbeatIncrement*2 ticks.
+		//
+		// TODO(irfansharif): Is that satisfying? This seems due to the
+		// particulars of etcd/raft, where it's not letting us distinguish
+		// between entries from stable storage vs. other nodes, in the current
+		// epoch. Ideally we'd process all the raft ready messages at the start
+		// (from stable storage, if any), apply it to local state, and then
+		// clear out the heartbeat statuses (waiting for new heartbeat requests
+		// going forward). We'd do this before handing over control to the user
+		// to avoid false positives immediately after restart.
+
+		if r.mu.ticker > heartbeatIncrement*2 {
+			r.mu.members[proposal.Member] = r.mu.ticker + heartbeatIncrement
+			r.log.Printf("received heartbeat for l=%d (at t=%d, valid until t=%d)",
+				proposal.Member, r.mu.ticker, r.mu.ticker+heartbeatIncrement)
+		}
 	case remove:
 		delete(r.mu.members, proposal.Member)
+		r.log.Printf("removed l=%d", proposal.Member)
 	}
 	return nil
 }
@@ -342,21 +357,24 @@ func (r *raftImpl) runRaftLoop() {
 			r.mu.raftReady = append(r.mu.raftReady, rd)
 			r.mu.Unlock()
 		case <-r.closeCh:
-			r.raft.node.Stop()
 			return
 		}
 	}
 }
 
-func (r *raftImpl) runWorkerLoop() {
+func (r *raftImpl) runHeartbeatLoop() {
 	for {
 		select {
-		case <-r.workCh:
-			exp := time.Now().Add(time.Second) // XXX: What's an appropriate duration?
+		case <-r.heartbeatCh:
+			if _, found := r.Live(r.ID()); !found {
+				continue
+			}
+
 			ctx := context.Background()
-			err := r.proposeWithRetry(ctx, proposal{Op: refresh, Member: r.ID(), T: exp})
-			if err != nil {
-				r.l.logger.Fatal(err)
+			r.log.Printf("sending out heartbeat")
+			err := r.proposeWithRetry(ctx, proposal{Op: heartbeat, Member: r.ID()})
+			if err != nil && err != raft.ErrStopped { // we could've been closed in the interim
+				r.log.Fatal(err)
 			}
 		case <-r.closeCh:
 			return
@@ -399,8 +417,8 @@ func (r *raftImpl) propose(ctx context.Context, pr proposal) error {
 		return err
 	}
 
-	if pr.Op == refresh {
-		return nil // for refreshes, we just fire and forget
+	if pr.Op == heartbeat {
+		return nil // for heartbeats, we just fire and forget
 	}
 	for {
 		select {
@@ -421,27 +439,24 @@ func startRaftImpl(l *liveness) *raftImpl {
 	}
 
 	r := &raftImpl{
-		l:       l,
-		closeCh: make(chan struct{}),
-		workCh:  make(chan struct{}),
+		l:           l,
+		closeCh:     make(chan struct{}),
+		heartbeatCh: make(chan struct{}),
 	}
-	r.mu.members = make(map[ID]time.Time)
+	r.mu.members = make(map[ID]uint64)
 	r.mu.outbox = make([]Message, 0)
-	var logger *log.Logger
-	if l.logger != nil {
-		logger = l.logger
-		logger.SetPrefix("[raft] ")
-		logger.SetFlags(0)
-	} else {
-		logger = log.New(ioutil.Discard, "[raft] ", 0)
-		l.logger = logger
+
+	logger := log.New(ioutil.Discard, fmt.Sprintf("[raft,l=%d] ", l.id), log.Ltime|log.Lmicroseconds|log.Lshortfile|log.Lmsgprefix)
+	if l.loggingTo != nil {
+		logger.SetOutput(l.loggingTo)
 	}
+	r.log = logger
 
 	r.raft.storage = raft.NewMemoryStorage()
-	if l.fromRaftStorage != nil {
+	if l.storage != nil {
 		// Recover the in-memory storage from persistent snapshot, state and
 		// entries.
-		hs, _, err := l.fromRaftStorage.InitialState()
+		hs, _, err := l.storage.InitialState()
 		if err != nil {
 			logger.Fatal(err)
 		}
@@ -449,16 +464,16 @@ func startRaftImpl(l *liveness) *raftImpl {
 			logger.Fatal(err)
 		}
 
-		fi, err := l.fromRaftStorage.FirstIndex()
+		fi, err := l.storage.FirstIndex()
 		if err != nil {
 			logger.Fatal(err)
 		}
-		li, err := l.fromRaftStorage.LastIndex()
+		li, err := l.storage.LastIndex()
 		if err != nil {
 			logger.Fatal(err)
 		}
-		entries, err := l.fromRaftStorage.Entries(fi, li+1, math.MaxUint64)
-		if err != nil {
+		entries, err := l.storage.Entries(fi, li+1, math.MaxUint64)
+		if err != nil && err != raft.ErrUnavailable { // it's possible that there were never any entries
 			logger.Fatal(err)
 		}
 		if err := r.raft.storage.Append(entries); err != nil {
@@ -480,39 +495,11 @@ func startRaftImpl(l *liveness) *raftImpl {
 		MaxSizePerMsg:   4096,
 		MaxInflightMsgs: 256,
 	}
-	raft.SetLogger(&raft.DefaultLogger{Logger: logger})
 
-	// XXX: We have two possible implementations.
-	// 1. An implementation where every node is a member
-	// 2. An implementation where there's a tiny set of members that use raft
-	//   among them, and other nodes find them to do anything.
-	//
-	// Let's focus on (1) first. We can start off with just node 1 being in the
-	// raft group, and each additional node seeding with node 1, proposing
-	// changes to it to get themselves added.
+	// TODO(irfansharif): Pass in an option for raft-internal logging?
+	discard := log.New(ioutil.Discard, "[raft] ", 0)
+	raft.SetLogger(&raft.DefaultLogger{Logger: discard})
 
-	// XXX: So there are two aspects: membership, and health.
-	// XXX: We'll also want to be able to switch out members of the raft group
-	// itself, I think. Though that's a whole another level of complexity that
-	// might not be all that worthwhile? It'll entail simulating movement of the
-	// raft group. The same applies for where the initial raft group gets
-	// formed. It has to start somewhere, and I don't think we should be too
-	// interested in having raft groups form independently and join together,
-	// cause we'd have to do that wiring ourselves. Maybe that's reasonable to
-	// do with rapid?
-	// So we'll start with a seed node, and have all nodes try to add themselves
-	// to the raft group.
-
-	// XXX: This basic raft backed implementation is essentially doing the same
-	// thing raft is internally doing with its heartbeats. On the one hand,
-	// that's kind of silly. Seems like the thing we'd otherwise be using paxos
-	// for. On the other hand, I'm not familiar with it.
-	//
-	// Actually, in raft heartbeats only go from leader to follower, and then
-	// heartbeat responses. A follower doesn't have the full view of the health
-	// of other followers (liveness in contrast is a lot more egalitarian).
-	// Also, doesn't look like etcd/raft exposes a view into how far back a
-	// follower is, or if it hasn't responded to heartbeat messages in a while.
 	var peers []raft.Peer
 	if l.bootstrap {
 		peers = append(peers, raft.Peer{ID: uint64(l.id)})
@@ -541,7 +528,7 @@ func startRaftImpl(l *liveness) *raftImpl {
 
 	r.raft.node = raft.StartNode(c, peers)
 	go r.runRaftLoop()
-	go r.runWorkerLoop()
+	go r.runHeartbeatLoop()
 
 	return r
 }

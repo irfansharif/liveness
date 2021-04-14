@@ -17,7 +17,7 @@ package liveness
 import (
 	"context"
 	"fmt"
-	"log"
+	"io"
 
 	"github.com/etcd-io/etcd/raft"
 )
@@ -40,23 +40,19 @@ type Message struct {
 // Liveness is a decentralized failure detector. It's the stand-alone module
 // that's to be connected with other instances of the same type. It's typically
 // be embedded into into something resembling a 'member' of a cluster, where
-// individual members are identified using unique IDs (guaranteed by the caller).
+// individual members are identified using unique IDs (as guaranteed by the
+// caller).
 //
 // Members communicate with one another using Messages. The transmission of
 // these messages is left up to the caller, which lets this package be portable
-// to any existing system. Liveness does not use any internal timers. It
+// to any existing system. Liveness does not use any internal timers. Instead it
 // understands the passage of time through successive Tick()s. How frequently
-// that is called is also left to the caller.
+// that is called is also left to the caller (typically every 10ms), but comes
+// with the benefit that it's a more deterministic and testable.
 //
-// XXX: We'll want to implement node restarts. It should probably want to hold
-// onto the same ID (so defer to caller to guarantee that, something to be
-// persisted to stable storage?). What about the peers? How does it know who to
-// join? Does it rediscover everything from scratch? What about it's own view of
-// membership? Actually, all of that happens implicitly by reading from stable
-// raft storage.
-//
-// What about if it was kicked out in the interim? I think we'll want some kind
-// of hand-shaking, right? It shouldn't be able to join if it was kicked out.
+// Liveness modules depend on stable storage for continuity across member
+// restarts. It's used to persist the assigned ID, last known
+// peer/membership-list, etc.
 type Liveness interface {
 	// ID returns the module's own identifier.
 	ID() ID
@@ -92,16 +88,28 @@ type Liveness interface {
 	Close()
 }
 
+// Storage is the medium through which a given liveness module interfaces with
+// stable storage. The data stored within is used to re-initialize liveness
+// modules after service restarts. This is where the assigned ID and last known
+// peer/membership-list is stored.
+//
+// TODO(irfansharif): Generalize this beyond just raft storage, and write
+// adaptors for test-only in-memory instances that wrap around
+// raft.MemoryStorage?
+type Storage interface {
+	raft.Storage
+}
+
 type liveness struct {
 	Liveness
 
 	id        ID
 	impl      string
-	logger    *log.Logger
+	loggingTo io.Writer
 	bootstrap bool
+	storage   Storage
 
-	mockRaftNode    raft.Node
-	fromRaftStorage raft.Storage
+	mockRaftNode raft.Node
 }
 
 // Option is used to configure a new liveness module.
@@ -134,16 +142,16 @@ func WithID(id ID) Option {
 	}
 }
 
-// WithLogger instantiates the liveness module with the given logger.
-func WithLogger(logger *log.Logger) Option {
+// WithLoggingTo instructs the liveness module to log to the given io.Writer.
+func WithLoggingTo(w io.Writer) Option {
 	return func(l *liveness) {
-		l.logger = logger
+		l.loggingTo = w
 	}
 }
 
 // WithBootstrap instructs the liveness module to bootstrap the cluster. Only
-// one liveness instance per cluster is to be bootstrapped, and subsequent
-// members are added to it or to other members added to it.
+// one liveness module per cluster is to be bootstrapped, just once, and
+// subsequent members are added to it (also transitively).
 //
 // TODO(irfansharif): This API is making up for the deficiency in the raft impl,
 // where we have to start off either with a consensus group of one node, or in
@@ -167,14 +175,16 @@ func WithImpl(impl string) Option {
 	}
 }
 
-func withMockRaftNode(mock raft.Node) Option {
+// WithStorage configures the liveness module to use the provided stable storage.
+func WithStorage(storage Storage) Option {
 	return func(l *liveness) {
-		l.mockRaftNode = mock
+		l.storage = storage
 	}
 }
 
-func withExistingRaftStorage(existing raft.Storage) Option {
+// withMockRaftNode is a testing helper to mock out raft.Node.
+func withMockRaftNode(mock raft.Node) Option {
 	return func(l *liveness) {
-		l.fromRaftStorage = existing
+		l.mockRaftNode = mock
 	}
 }
