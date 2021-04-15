@@ -18,6 +18,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"os"
 	"sync"
 	"testing"
 	"time"
@@ -403,6 +404,7 @@ func TestRaftImplPartitionedNode(t *testing.T) {
 
 func TestRaftImplRestartedNode(t *testing.T) {
 	defer leaktest.Check(t)()
+	t.Skipf("we're no longer detecting insta node restarts as failures; will need epochs")
 
 	const numMembers = 10
 	const bootstrapMember, restartedMember ID = 1, 3
@@ -410,7 +412,7 @@ func TestRaftImplRestartedNode(t *testing.T) {
 	n := newNetwork()
 	var bootstrapped Liveness
 	for i := 1; i <= numMembers; i++ {
-		opts := []Option{WithID(ID(i)), WithImpl("raft")}
+		opts := []Option{WithID(ID(i)), WithImpl("raft"), WithLoggingTo(os.Stderr)}
 		if ID(i) == bootstrapMember {
 			opts = append(opts, WithBootstrap())
 		}
@@ -434,14 +436,15 @@ func TestRaftImplRestartedNode(t *testing.T) {
 
 	n.stop(restartedMember)
 	n.restart(restartedMember)
+
 	testutils.SucceedsSoon(t, func() error {
 		for _, l := range n.ls {
 			live, found := l.Live(restartedMember)
 			if !found {
-				return fmt.Errorf("expected to find liveness status for id=%s", restartedMember)
+				return fmt.Errorf("%d: expected to find liveness status for id=%s", l.ID(), restartedMember)
 			}
 			if live {
-				return fmt.Errorf("expected to find id=%s as non-live", restartedMember)
+				return fmt.Errorf("%d: expected to find id=%s as non-live", l.ID(), restartedMember)
 			}
 		}
 		return nil
@@ -482,6 +485,10 @@ func TestRaftImplRemovePartitionedNode(t *testing.T) {
 	n.stop(removedMember)
 	testutils.SucceedsSoon(t, func() error {
 		for _, l := range n.ls {
+			if l.ID() == removedMember {
+				continue
+			}
+
 			live, found := l.Live(removedMember)
 			if !found {
 				return fmt.Errorf("expected to find liveness status for id=%s", removedMember)
@@ -629,7 +636,7 @@ func (n *network) restart(member ID) {
 
 	old := n.get(member)
 	old.Close()
-	impl := old.(*liveness).Liveness.(*raftImpl)
+	impl := old.(*L).Liveness.(*raftImpl)
 	l := New(
 		WithID(member),
 		WithImpl("raft"),

@@ -16,11 +16,13 @@ package liveness
 
 import (
 	"context"
+	"encoding/binary"
 	"encoding/json"
 	"fmt"
 	"io/ioutil"
 	"log"
 	"math"
+	"math/rand"
 	"sort"
 	"sync"
 	"time"
@@ -34,21 +36,22 @@ import (
 // configurable? If ticker duration is 10ms, heartbeatIncrement=100 is a
 // heartbeat extension of 1s, with heartbeats happening every 0.5s.
 
-const heartbeatIncrement = 100
+const heartbeatIncrement = 20
 
 type raftImpl struct {
-	l   *liveness
+	l   *L
 	log *log.Logger
 
 	mu struct {
 		sync.Mutex
-		members map[ID]uint64 // member: ticker expiration
-		inbox   []Message
-		outbox  []Message
-		closed  bool
-
-		raftReady []raft.Ready
-		ticker    uint64
+		members    map[ID]uint64 // member: ticker expiration
+		inbox      []Message
+		outbox     []Message
+		linearized bool
+		closed     bool
+		inflight   map[uint64]chan struct{}
+		raftReady  []raft.Ready
+		ticker     uint64
 	}
 
 	raft struct {
@@ -74,6 +77,23 @@ func (r *raftImpl) Close() {
 }
 
 func (r *raftImpl) Live(member ID) (live, found bool) {
+	// Reading from the applied state is potentially stale (albeit consistent)
+	// if done so through through a follower replica. We can use etcd's
+	// linearizable read-only request here. We'd want to generate a unique
+	// request ID, push it through raft, and when it comes back out downstream
+	// of raft, feel free to read from the applied state.
+	if r.l.linearizable {
+		// TODO(irfansharif): Linearizable reads round-trip through raft, so
+		// don't work on partitioned nodes. What's a good API that lets us
+		// distinguish between linearizable reads and stale ones?
+		ctx := context.Background() // TODO(irfansharif): Plumb at caller?
+		_ = r.linearizeWithRetry(ctx)
+	}
+
+	return r.liveInternal(member)
+}
+
+func (r *raftImpl) liveInternal(member ID) (live, found bool) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 
@@ -134,6 +154,17 @@ func (r *raftImpl) Tick() {
 	for _, rd := range r.mu.raftReady {
 		if err := r.saveLocked(rd.Entries, rd.HardState, rd.Snapshot); err != nil {
 			r.log.Fatal(err)
+		}
+
+		// Look for any read request results, and if found, signal the waiting
+		// thread.
+		if len(rd.ReadStates) != 0 {
+			for _, rs := range rd.ReadStates {
+				req := binary.BigEndian.Uint64(rs.RequestCtx)
+				if ch, ok := r.mu.inflight[req]; ok {
+					close(ch)
+				}
+			}
 		}
 
 		// Slate all outgoing raft messages for delivery.
@@ -205,7 +236,8 @@ func (r *raftImpl) ID() ID {
 // Add adds the identified member to the cluster. It retries/reproposes
 // internally, returning only once the member was successfully added.
 func (r *raftImpl) Add(ctx context.Context, member ID) error {
-	if _, found := r.Live(member); found {
+	// TODO(irfansharif): What happens if the same member is added concurrently?
+	if _, found := r.liveInternal(member); found {
 		return fmt.Errorf("can't add %d, already exists", member)
 	}
 	cc := raftpb.ConfChange{Type: raftpb.ConfChangeAddNode, NodeID: uint64(member)}
@@ -289,49 +321,39 @@ func (r *raftImpl) applyEntryLocked(entry raftpb.Entry) error {
 		// to be able to quickly restart and insta-heartbeat without other nodes
 		// finding about it? Probably not, there's no benefit to it, and it's
 		// not what CRDB does. It also opens up the possibility for false
-		// negatives. So what should be done?
+		// negatives. So what should be done? Heartbeats could also include
+		// epochs; that way all other nodes would learn about the epoch bump.
 
 		// When applying heartbeat requests it happens from one of two ways:
 		//
 		// 	a. through regular raft replication, while we're live and healthy
 		// 	b. when restarting a node, and reapplying previous entries
 		//
-		// Computing the lease extension ticker count during (a) is fine, but
+		// Computing the heartbeat extension ticker count during (a) is fine, but
 		// during (b) is nonsensical. What's to be done? Ideally we'd be able to
 		// distinguish (does etcd/raft let us?), and simply not apply any
 		// heartbeat requests post-restart. We'd then rely on the subsequent
-		// heartbeat from all peers to ascertain health status. Basically
-		// heartbeats should be time bound.
+		// heartbeat from all peers to ascertain health status. Basically we
+		// want heartbeats to be time bound.
 		//
-		// TODO(irfansharif): Separately, at the start, perhaps we want to wait
-		// out our previous epoch's heartbeat lease (or something) so that other
-		// nodes are able to detect our blip. A "simple" fix: each module can
-		// send out it's first heartbeat request only after the
-		// heartbeatIncrement*2 ticks, so it's guaranteed to appear as failed to
-		// all other nodes.
-		//
-		// In doing "is live" this way (through applied state based on
+		// In doing Live() this way (by reading the applied state based on
 		// raft commands, without real timers), a lagging follower will always
 		// have a stale view of liveness. The up-to-date view of liveness will
 		// only appear at the leader node (and up-to-date) followers. In raft,
 		// no single follower is aware that it's lagging behind. So it can't
 		// distinguish between a heartbeat request made "at the same time" and
 		// one made in the past, that it's only now finding out about. We'd have
-		// to go to the leader to retrieve an up-to-date view of liveness.
+		// to go to the leader to retrieve an up-to-date view of liveness. We
+		// can do this through the linearizable switch, but that comes at the
+		// cost of making Live() inaccessible for members that can't contact the
+		// leader.
 		//
-		// To prevent the false positive post-restart, we don't process any
-		// heartbeat requests for the first heartbeatIncrement*2 ticks.
-		//
-		// TODO(irfansharif): Is that satisfying? This seems due to the
-		// particulars of etcd/raft, where it's not letting us distinguish
-		// between entries from stable storage vs. other nodes, in the current
-		// epoch. Ideally we'd process all the raft ready messages at the start
-		// (from stable storage, if any), apply it to local state, and then
-		// clear out the heartbeat statuses (waiting for new heartbeat requests
-		// going forward). We'd do this before handing over control to the user
-		// to avoid false positives immediately after restart.
+		// We also use a linearization point post-member-start to catch up to
+		// all applied commands, without applying any heartbeat requests until
+		// we do so. This gives us the property that we don't apply heartbeats
+		// from before we were restarted.
 
-		if r.mu.ticker > heartbeatIncrement*2 {
+		if r.mu.linearized {
 			r.mu.members[proposal.Member] = r.mu.ticker + heartbeatIncrement
 			r.log.Printf("received heartbeat for l=%d (at t=%d, valid until t=%d)",
 				proposal.Member, r.mu.ticker, r.mu.ticker+heartbeatIncrement)
@@ -366,12 +388,11 @@ func (r *raftImpl) runHeartbeatLoop() {
 	for {
 		select {
 		case <-r.heartbeatCh:
-			if _, found := r.Live(r.ID()); !found {
+			if _, found := r.liveInternal(r.ID()); !found {
 				continue
 			}
 
 			ctx := context.Background()
-			r.log.Printf("sending out heartbeat")
 			err := r.proposeWithRetry(ctx, proposal{Op: heartbeat, Member: r.ID()})
 			if err != nil && err != raft.ErrStopped { // we could've been closed in the interim
 				r.log.Fatal(err)
@@ -379,6 +400,61 @@ func (r *raftImpl) runHeartbeatLoop() {
 		case <-r.closeCh:
 			return
 		}
+	}
+}
+
+func (r *raftImpl) linearize() {
+	linearizeCh := make(chan struct{})
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	go func() {
+		if err := r.linearizeWithRetry(ctx); err != nil {
+			r.log.Printf("error during linearization: %v", err)
+			return
+		}
+
+		r.mu.Lock()
+		r.mu.linearized = true
+		r.mu.Unlock()
+		close(linearizeCh)
+	}()
+
+	select {
+	case <-r.closeCh:
+		return
+	case <-linearizeCh:
+		return
+	}
+}
+
+func (r *raftImpl) linearizeWithRetry(ctx context.Context) error {
+	req, ch := rand.Uint64(), make(chan struct{})
+	r.mu.Lock()
+	r.mu.inflight[req] = ch
+	r.mu.Unlock()
+	defer func() {
+		r.mu.Lock()
+		delete(r.mu.inflight, req)
+		r.mu.Unlock()
+	}()
+
+	bs := make([]byte, 8)
+	binary.BigEndian.PutUint64(bs, req)
+	for {
+		childCtx, _ := context.WithTimeout(ctx, 100*time.Millisecond)
+		if err := r.raft.node.ReadIndex(ctx, bs); err != nil {
+			return err
+		}
+
+		select {
+		case <-ctx.Done(): // the top-level context has expired
+			return ctx.Err()
+		case <-childCtx.Done():
+			continue // re-propose
+		case <-ch:
+		}
+		return nil
 	}
 }
 
@@ -420,20 +496,21 @@ func (r *raftImpl) propose(ctx context.Context, pr proposal) error {
 	if pr.Op == heartbeat {
 		return nil // for heartbeats, we just fire and forget
 	}
+
 	for {
 		select {
 		case <-ctx.Done():
 			return ctx.Err()
 		default:
 		}
-		_, found := r.Live(pr.Member)
+		_, found := r.liveInternal(pr.Member)
 		if pr.Op == add && found || pr.Op == remove && !found {
 			return nil
 		}
 	}
 }
 
-func startRaftImpl(l *liveness) *raftImpl {
+func startRaftImpl(l *L) *raftImpl {
 	if l.id == 0 {
 		panic(fmt.Sprintf("invalid ID: %d", l.id))
 	}
@@ -444,6 +521,7 @@ func startRaftImpl(l *liveness) *raftImpl {
 		heartbeatCh: make(chan struct{}),
 	}
 	r.mu.members = make(map[ID]uint64)
+	r.mu.inflight = make(map[uint64]chan struct{})
 	r.mu.outbox = make([]Message, 0)
 
 	logger := log.New(ioutil.Discard, fmt.Sprintf("[raft,l=%d] ", l.id), log.Ltime|log.Lmicroseconds|log.Lshortfile|log.Lmsgprefix)
@@ -497,7 +575,7 @@ func startRaftImpl(l *liveness) *raftImpl {
 	}
 
 	// TODO(irfansharif): Pass in an option for raft-internal logging?
-	discard := log.New(ioutil.Discard, "[raft] ", 0)
+	discard := log.New(ioutil.Discard, "[raft-internal] ", 0)
 	raft.SetLogger(&raft.DefaultLogger{Logger: discard})
 
 	var peers []raft.Peer
@@ -529,6 +607,7 @@ func startRaftImpl(l *liveness) *raftImpl {
 	r.raft.node = raft.StartNode(c, peers)
 	go r.runRaftLoop()
 	go r.runHeartbeatLoop()
+	go r.linearize()
 
 	return r
 }

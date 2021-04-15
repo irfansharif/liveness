@@ -100,27 +100,29 @@ type Storage interface {
 	raft.Storage
 }
 
-type liveness struct {
+// L is a concrete implementation of the Liveness interface.
+type L struct {
 	Liveness
 
-	id        ID
-	impl      string
-	loggingTo io.Writer
-	bootstrap bool
-	storage   Storage
-
+	// User provided options.
+	id           ID
+	impl         string
+	loggingTo    io.Writer
+	bootstrap    bool
+	linearizable bool
+	storage      Storage
 	mockRaftNode raft.Node
 }
 
 // Option is used to configure a new liveness module.
-type Option func(l *liveness)
+type Option func(l *L)
 
 // New instantiates a liveness modules using the provided configuration options.
 //
 // TODO(irfansharif): This also "starts" the module by firing off the goroutines
 // underneath. Rename?
-func New(opts ...Option) *liveness {
-	l := &liveness{}
+func New(opts ...Option) *L {
+	l := &L{}
 	for _, opt := range opts {
 		opt(l)
 	}
@@ -137,14 +139,14 @@ func New(opts ...Option) *liveness {
 
 // WithID configures the liveness module with the given ID.
 func WithID(id ID) Option {
-	return func(l *liveness) {
+	return func(l *L) {
 		l.id = id
 	}
 }
 
 // WithLoggingTo instructs the liveness module to log to the given io.Writer.
 func WithLoggingTo(w io.Writer) Option {
-	return func(l *liveness) {
+	return func(l *L) {
 		l.loggingTo = w
 	}
 }
@@ -158,7 +160,7 @@ func WithLoggingTo(w io.Writer) Option {
 // that waiting peer state. Ideally we'd be able to simply l.Bootstrap() a
 // brother. Also, does this API generalize to other implementations?
 func WithBootstrap() Option {
-	return func(l *liveness) {
+	return func(l *L) {
 		l.bootstrap = true
 	}
 }
@@ -167,7 +169,7 @@ func WithBootstrap() Option {
 func WithImpl(impl string) Option {
 	switch impl {
 	case "raft":
-		return func(l *liveness) {
+		return func(l *L) {
 			l.impl = impl
 		}
 	default:
@@ -177,14 +179,20 @@ func WithImpl(impl string) Option {
 
 // WithStorage configures the liveness module to use the provided stable storage.
 func WithStorage(storage Storage) Option {
-	return func(l *liveness) {
+	return func(l *L) {
 		l.storage = storage
+	}
+}
+
+func WithLinearizability() Option {
+	return func(l *L) {
+		l.linearizable = true
 	}
 }
 
 // withMockRaftNode is a testing helper to mock out raft.Node.
 func withMockRaftNode(mock raft.Node) Option {
-	return func(l *liveness) {
+	return func(l *L) {
 		l.mockRaftNode = mock
 	}
 }
