@@ -22,14 +22,6 @@ import (
 	"github.com/etcd-io/etcd/raft"
 )
 
-// ID is used to identify an individual member in the cluster. The caller is
-// responsible for guaranteeing that these are unique.
-type ID uint64
-
-func (id ID) String() string {
-	return fmt.Sprintf("%d", id)
-}
-
 // Message is the unit of data transmitted between members in the cluster. These
 // could be messages that capture heartbeats, membership changes, etc.
 type Message struct {
@@ -39,9 +31,8 @@ type Message struct {
 
 // Liveness is a decentralized failure detector. It's the stand-alone module
 // that's to be connected with other instances of the same type. It's typically
-// be embedded into into something resembling a 'member' of a cluster, where
-// individual members are identified using unique IDs (as guaranteed by the
-// caller).
+// embedded into something resembling a member of a cluster, where individual
+// members are identified using unique IDs (as guaranteed by the caller).
 //
 // Members communicate with one another using Messages. The transmission of
 // these messages is left up to the caller, which lets this package be portable
@@ -57,9 +48,7 @@ type Liveness interface {
 	// ID returns the module's own identifier.
 	ID() ID
 
-	// Add adds the identified member to the cluster. This is a transitive
-	// operation. Adding a member will also transitively propose other members
-	// it knows about.
+	// Add adds the identified member to the cluster.
 	Add(ctx context.Context, member ID) error
 
 	// Remove removes the identified member from the cluster.
@@ -83,9 +72,17 @@ type Liveness interface {
 	// Outbox returns a list of outbound messages to send to other modules.
 	Outbox() []Message
 
-	// Close tears down the liveness module and frees up any internal resources
-	// (typically goroutines).
-	Close()
+	// Teardown tears down the liveness module and frees up any internal
+	// resources (typically goroutines).
+	Teardown()
+}
+
+// ID is used to identify an individual member in the cluster. The caller is
+// responsible for guaranteeing that these are unique.
+type ID uint64
+
+func (id ID) String() string {
+	return fmt.Sprintf("liveness-id=%d", id)
 }
 
 // Storage is the medium through which a given liveness module interfaces with
@@ -107,9 +104,9 @@ type L struct {
 	// User provided options.
 	id           ID
 	impl         string
+	central      map[ID]struct{}
 	loggingTo    io.Writer
 	bootstrap    bool
-	linearizable bool
 	storage      Storage
 	mockRaftNode raft.Node
 }
@@ -117,11 +114,8 @@ type L struct {
 // Option is used to configure a new liveness module.
 type Option func(l *L)
 
-// New instantiates a liveness modules using the provided configuration options.
-//
-// TODO(irfansharif): This also "starts" the module by firing off the goroutines
-// underneath. Rename?
-func New(opts ...Option) *L {
+// Start starts a liveness modules using the provided configuration options.
+func Start(opts ...Option) *L {
 	l := &L{}
 	for _, opt := range opts {
 		opt(l)
@@ -184,9 +178,13 @@ func WithStorage(storage Storage) Option {
 	}
 }
 
-func WithLinearizability() Option {
+func WithCentral(members ...ID) Option {
 	return func(l *L) {
-		l.linearizable = true
+		central := make(map[ID]struct{})
+		for _, m := range members {
+			central[m] = struct{}{}
+		}
+		l.central = central
 	}
 }
 

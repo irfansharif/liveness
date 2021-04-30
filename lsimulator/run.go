@@ -88,7 +88,7 @@ func (s *simulator) run(nodes int, fdetector string, duration time.Duration) err
 		n := &node{
 			log:      log.New(s.log.Writer(), fmt.Sprintf("N%03d: ", i), 0),
 			network:  n,
-			Liveness: liveness.New(opts...),
+			Liveness: liveness.Start(opts...),
 		}
 		n.nodes = append(n.nodes, n)
 	}

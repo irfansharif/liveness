@@ -31,27 +31,35 @@ import (
 	"github.com/etcd-io/etcd/raft"
 )
 
+// TODO(irfansharif): When we implement the centralized version of this, we
+// could "fake" replica removal/recovery through the network itself, promoting
+// stand-by nodes to assume raft-membership, and dropping old ones. Does that
+// simulate anything useful though? Maybe just movement of the leader node over
+// time, as failures happen? Feels far-fetched; there are more useful things to
+// simulate.
+
 // TODO(irfansharif): It's unclear what this constant should be. It's coupled to
 // the ticker duration the caller decides to use, so should probably be
 // configurable? If ticker duration is 10ms, heartbeatIncrement=100 is a
 // heartbeat extension of 1s, with heartbeats happening every 0.5s.
-
 const heartbeatIncrement = 20
 
+// raftImpl implements the Liveness interface. It adds all members to the
+// consensus group, and health is maintained by means of periodic proposals.
 type raftImpl struct {
 	l   *L
 	log *log.Logger
 
 	mu struct {
 		sync.Mutex
-		members    map[ID]uint64 // member: ticker expiration
-		inbox      []Message
-		outbox     []Message
-		linearized bool
-		closed     bool
-		inflight   map[uint64]chan struct{}
-		raftReady  []raft.Ready
-		ticker     uint64
+		members                 map[ID]uint64 // member: ticker expiration
+		inbox                   []Message
+		outbox                  []Message
+		readyToAcceptHeartbeats bool
+		closed                  bool
+		inflight                map[uint64]chan struct{}
+		raftReady               []raft.Ready
+		ticker                  uint64
 	}
 
 	raft struct {
@@ -63,7 +71,8 @@ type raftImpl struct {
 	closeCh     chan struct{}
 }
 
-func (r *raftImpl) Close() {
+// Teardown is part of the Liveness interface.
+func (r *raftImpl) Teardown() {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 
@@ -76,20 +85,19 @@ func (r *raftImpl) Close() {
 	r.mu.closed = true
 }
 
+// Live is part of the Liveness interface.
+//
+// TODO(irfansharif): In doing Live() this way (by reading the applied state
+// based on raft commands, without real timers), a lagging follower will always
+// have a stale view of liveness. The up-to-date view of liveness will only
+// appear at the leader node (and up-to-date) followers. In raft, no single
+// follower is aware that it's lagging behind. So it can't distinguish between a
+// heartbeat request made "at the same time" and one made in the past, that it's
+// only now finding out about. We'd have to go to the leader to retrieve an
+// up-to-date view of liveness. We can do this through the linearizable switch,
+// by exporting livenessWithRetry, accepting the cost that it's inaccessible for
+// members that can't contact the leader.
 func (r *raftImpl) Live(member ID) (live, found bool) {
-	// Reading from the applied state is potentially stale (albeit consistent)
-	// if done so through through a follower replica. We can use etcd's
-	// linearizable read-only request here. We'd want to generate a unique
-	// request ID, push it through raft, and when it comes back out downstream
-	// of raft, feel free to read from the applied state.
-	if r.l.linearizable {
-		// TODO(irfansharif): Linearizable reads round-trip through raft, so
-		// don't work on partitioned nodes. What's a good API that lets us
-		// distinguish between linearizable reads and stale ones?
-		ctx := context.Background() // TODO(irfansharif): Plumb at caller?
-		_ = r.linearizeWithRetry(ctx)
-	}
-
 	return r.liveInternal(member)
 }
 
@@ -101,6 +109,7 @@ func (r *raftImpl) liveInternal(member ID) (live, found bool) {
 	return r.mu.ticker < exp, found
 }
 
+// Members is part of the Liveness interface.
 func (r *raftImpl) Members() []ID {
 	r.mu.Lock()
 	defer r.mu.Unlock()
@@ -116,8 +125,7 @@ func (r *raftImpl) Members() []ID {
 	return members
 }
 
-// Tick moves forward the failure detectors internal notion of time. The caller
-// is responsible for calling it periodically.
+// Tick is part of the Liveness interface.
 //
 // TODO(irfansharif): Implement raft snapshots.
 func (r *raftImpl) Tick() {
@@ -162,6 +170,7 @@ func (r *raftImpl) Tick() {
 			for _, rs := range rd.ReadStates {
 				req := binary.BigEndian.Uint64(rs.RequestCtx)
 				if ch, ok := r.mu.inflight[req]; ok {
+					delete(r.mu.inflight, req)
 					close(ch)
 				}
 			}
@@ -205,7 +214,7 @@ func (r *raftImpl) Tick() {
 	r.mu.raftReady = r.mu.raftReady[:0] // clear out the raft ready buffer
 }
 
-// Outbox returns a list of outbound messages.
+// Outbox is part of the Liveness interface.
 func (r *raftImpl) Outbox() []Message {
 	r.mu.Lock()
 	defer r.mu.Unlock()
@@ -215,7 +224,7 @@ func (r *raftImpl) Outbox() []Message {
 	return outbox
 }
 
-// Inbox accepts the incoming message.
+// Inbox is part of the Liveness interface.
 func (r *raftImpl) Inbox(msgs ...Message) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
@@ -228,28 +237,37 @@ func (r *raftImpl) Inbox(msgs ...Message) {
 	r.mu.inbox = append(r.mu.inbox, msgs...)
 }
 
-// ID returns the module's own identifier.
+// ID is part of the Liveness interface.
 func (r *raftImpl) ID() ID {
 	return r.l.id
 }
 
-// Add adds the identified member to the cluster. It retries/reproposes
-// internally, returning only once the member was successfully added.
+// Add is part of the Liveness interface. It retries/reproposes internally,
+// returning only once the member was successfully added.
 func (r *raftImpl) Add(ctx context.Context, member ID) error {
 	// TODO(irfansharif): What happens if the same member is added concurrently?
 	if _, found := r.liveInternal(member); found {
 		return fmt.Errorf("can't add %d, already exists", member)
 	}
-	cc := raftpb.ConfChange{Type: raftpb.ConfChangeAddNode, NodeID: uint64(member)}
+
+	ctype, learner := raftpb.ConfChangeAddLearnerNode, true
+	if len(r.l.central) == 0 {
+		ctype, learner = raftpb.ConfChangeAddNode, false
+	} else {
+		if _, ok := r.l.central[member]; ok {
+			ctype, learner = raftpb.ConfChangeAddNode, false
+		}
+	}
+	cc := raftpb.ConfChange{Type: ctype, NodeID: uint64(member)}
 	if err := r.raft.node.ProposeConfChange(ctx, cc); err != nil {
 		return err
 	}
-	r.log.Printf("proposing to add l=%d", member)
+	r.log.Printf("proposing to add l=%d as learner=%t", member, learner)
 	return r.proposeWithRetry(ctx, proposal{Member: member, Op: add})
 }
 
-// Remove removes the identified member from the cluster. It retries/reproposes
-// internally, returning only once the member was successfully removed.
+// Remove is part of the Liveness interface. It retries/reproposes internally,
+// returning only once the member was successfully removed.
 func (r *raftImpl) Remove(ctx context.Context, member ID) error {
 	cc := raftpb.ConfChange{Type: raftpb.ConfChangeRemoveNode, NodeID: uint64(member)}
 	if err := r.raft.node.ProposeConfChange(ctx, cc); err != nil {
@@ -331,29 +349,18 @@ func (r *raftImpl) applyEntryLocked(entry raftpb.Entry) error {
 		//
 		// Computing the heartbeat extension ticker count during (a) is fine, but
 		// during (b) is nonsensical. What's to be done? Ideally we'd be able to
-		// distinguish (does etcd/raft let us?), and simply not apply any
-		// heartbeat requests post-restart. We'd then rely on the subsequent
-		// heartbeat from all peers to ascertain health status. Basically we
-		// want heartbeats to be time bound.
+		// distinguish and not apply any heartbeat requests from before we were
+		// started up. We want to only rely on the subsequent heartbeat from all
+		// peers to ascertain health status. Unfortunately etcd doesn't expose
+		// an API for us to ascertain which log records are being read off
+		// stable storage, and which ones are being received live.
 		//
-		// In doing Live() this way (by reading the applied state based on
-		// raft commands, without real timers), a lagging follower will always
-		// have a stale view of liveness. The up-to-date view of liveness will
-		// only appear at the leader node (and up-to-date) followers. In raft,
-		// no single follower is aware that it's lagging behind. So it can't
-		// distinguish between a heartbeat request made "at the same time" and
-		// one made in the past, that it's only now finding out about. We'd have
-		// to go to the leader to retrieve an up-to-date view of liveness. We
-		// can do this through the linearizable switch, but that comes at the
-		// cost of making Live() inaccessible for members that can't contact the
-		// leader.
-		//
-		// We also use a linearization point post-member-start to catch up to
-		// all applied commands, without applying any heartbeat requests until
-		// we do so. This gives us the property that we don't apply heartbeats
-		// from before we were restarted.
+		// To work around this, we submit a linearizable read-only request
+		// through raft during startup, and wait for it to be received back here
+		// before applying any heartbeat proposals. This has the effect of
+		// filtering out all earlier heartbeat proposals.
 
-		if r.mu.linearized {
+		if r.mu.readyToAcceptHeartbeats {
 			r.mu.members[proposal.Member] = r.mu.ticker + heartbeatIncrement
 			r.log.Printf("received heartbeat for l=%d (at t=%d, valid until t=%d)",
 				proposal.Member, r.mu.ticker, r.mu.ticker+heartbeatIncrement)
@@ -384,6 +391,8 @@ func (r *raftImpl) runRaftLoop() {
 	}
 }
 
+// runHeartbeatLoop periodically sends a heartbeat proposal for itself. It's to
+// be run in a separate goroutine.
 func (r *raftImpl) runHeartbeatLoop() {
 	for {
 		select {
@@ -403,7 +412,13 @@ func (r *raftImpl) runHeartbeatLoop() {
 	}
 }
 
-func (r *raftImpl) linearize() {
+// prepareToAcceptHeartbeats is run during start-up, in a separate goroutine, to
+// catch this member up to the current raft state. It does so by submitting a
+// linearizable read-only request through raft, and waits for it to be accepted.
+// Once that happens, we can start accepting subsequent heartbeat proposals
+// through raft (while having filtered our heartbeat proposals from before we
+// had been started).
+func (r *raftImpl) prepareToAcceptHeartbeats() {
 	linearizeCh := make(chan struct{})
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -415,7 +430,7 @@ func (r *raftImpl) linearize() {
 		}
 
 		r.mu.Lock()
-		r.mu.linearized = true
+		r.mu.readyToAcceptHeartbeats = true
 		r.mu.Unlock()
 		close(linearizeCh)
 	}()
@@ -428,14 +443,22 @@ func (r *raftImpl) linearize() {
 	}
 }
 
+// linearizeWithRetry submits a linearizable read-only raft proposal and waits
+// for it to come out of raft. This has the effect of catching up this liveness
+// with the rest of the consensus group. Future reads of the membership state
+// are guaranteed to be at least as up-to-date as the submitted read request.
+//
+// TODO(irfansharif): This seems useful enough to export? Name it Synchronize?
+// It'd be useful in conjunction with Live() and Members().
 func (r *raftImpl) linearizeWithRetry(ctx context.Context) error {
 	req, ch := rand.Uint64(), make(chan struct{})
 	r.mu.Lock()
 	r.mu.inflight[req] = ch
 	r.mu.Unlock()
+
 	defer func() {
 		r.mu.Lock()
-		delete(r.mu.inflight, req)
+		delete(r.mu.inflight, req) // usually cleaned up downstream of raft, but we could error out
 		r.mu.Unlock()
 	}()
 
@@ -580,6 +603,16 @@ func startRaftImpl(l *L) *raftImpl {
 
 	var peers []raft.Peer
 	if l.bootstrap {
+		if len(l.central) != 0 {
+			if _, ok := l.central[l.id]; !ok {
+				cmembers := make([]ID, 0, len(l.central))
+				for cmember := range l.central {
+					cmembers = append(cmembers, cmember)
+				}
+				panic(fmt.Sprintf("bootstrap member %d not found in central membership %s", l.id, cmembers))
+			}
+		}
+
 		peers = append(peers, raft.Peer{ID: uint64(l.id)})
 		// There's no good time to propose with self to let future members learn
 		// about it. So we initialize the raft storage with raft state
@@ -607,7 +640,7 @@ func startRaftImpl(l *L) *raftImpl {
 	r.raft.node = raft.StartNode(c, peers)
 	go r.runRaftLoop()
 	go r.runHeartbeatLoop()
-	go r.linearize()
+	go r.prepareToAcceptHeartbeats()
 
 	return r
 }

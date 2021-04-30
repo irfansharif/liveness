@@ -36,11 +36,11 @@ import (
 func TestRaftImplClose(t *testing.T) {
 	defer leaktest.Check(t)()
 
-	New(
+	Start(
 		WithID(ID(1)),
 		WithImpl("raft"),
 		WithBootstrap(),
-	).Close()
+	).Teardown()
 }
 
 // TestRaftImplIllegalID tests that we appropriately panic when instantiating
@@ -49,7 +49,7 @@ func TestRaftImplIllegalID(t *testing.T) {
 	defer leaktest.Check(t)()
 
 	testutils.ShouldPanic(t, "invalid ID: 0", func() {
-		New(
+		Start(
 			WithID(ID(0)),
 			WithImpl("raft"),
 			WithBootstrap(),
@@ -62,12 +62,12 @@ func TestRaftImplIllegalID(t *testing.T) {
 func TestRaftImplMisroutedMessage(t *testing.T) {
 	defer leaktest.Check(t)()
 
-	l := New(
+	l := Start(
 		WithID(ID(1)),
 		WithImpl("raft"),
 		WithBootstrap(),
 	)
-	defer l.Close()
+	defer l.Teardown()
 
 	testutils.ShouldPanic(t, "misrouted messaged, intended for 42 but sent to 1", func() {
 		l.Inbox(Message{To: 42})
@@ -105,13 +105,13 @@ func TestRaftImplTick(t *testing.T) {
 	mrn := &mockRaftNode{
 		readyc: make(chan raft.Ready, 1),
 	}
-	l := New(
+	l := Start(
 		WithID(ID(1)),
 		WithImpl("raft"),
 		WithBootstrap(),
 		withMockRaftNode(mrn),
 	)
-	defer l.Close()
+	defer l.Teardown()
 
 	impl := l.Liveness.(*raftImpl)
 
@@ -174,7 +174,7 @@ func TestRaftImplSingleMembership(t *testing.T) {
 
 	n := newNetwork()
 	id := ID(1)
-	l := New(
+	l := Start(
 		WithID(id),
 		WithImpl("raft"),
 		WithBootstrap(),
@@ -235,8 +235,8 @@ func TestRaftImplMultipleAdd(t *testing.T) {
 					opts = append(opts, WithBootstrap())
 				}
 
-				l := New(opts...)
-				defer l.Close()
+				l := Start(opts...)
+				defer l.Teardown()
 
 				cluster = append(cluster, l)
 				if i == tc.bootstrap {
@@ -299,8 +299,8 @@ func TestRaftImplMultipleRemove(t *testing.T) {
 					opts = append(opts, WithBootstrap())
 				}
 
-				l := New(opts...)
-				defer l.Close()
+				l := Start(opts...)
+				defer l.Teardown()
 
 				cluster = append(cluster, l)
 			}
@@ -356,7 +356,7 @@ func TestRaftImplPartitionedNode(t *testing.T) {
 			opts = append(opts, WithBootstrap())
 		}
 
-		l := New(opts...) // closed by the network teardown below
+		l := Start(opts...) // closed by the network teardown below
 		n.ls = append(n.ls, l)
 		if ID(i) == bootstrapMember {
 			bootstrapped = l
@@ -417,7 +417,7 @@ func TestRaftImplRestartedNode(t *testing.T) {
 			opts = append(opts, WithBootstrap())
 		}
 
-		l := New(opts...) // closed by the network teardown below
+		l := Start(opts...) // closed by the network teardown below
 		n.ls = append(n.ls, l)
 		if ID(i) == bootstrapMember {
 			bootstrapped = l
@@ -465,7 +465,7 @@ func TestRaftImplRemovePartitionedNode(t *testing.T) {
 			opts = append(opts, WithBootstrap())
 		}
 
-		l := New(opts...) // closed by the network teardown below
+		l := Start(opts...) // closed by the network teardown below
 		n.ls = append(n.ls, l)
 		if ID(i) == bootstrapMember {
 			bootstrapped = l
@@ -543,7 +543,7 @@ func TestRaftImplMembersAppearNonLiveAfterQuickRestart(t *testing.T) {
 			opts = append(opts, WithBootstrap())
 		}
 
-		l := New(opts...) // closed by the network teardown below
+		l := Start(opts...) // closed by the network teardown below
 		n.ls = append(n.ls, l)
 		if ID(i) == bootstrapMember {
 			bootstrapped = l
@@ -599,6 +599,72 @@ func TestRaftImplMembersAppearNonLiveAfterQuickRestart(t *testing.T) {
 	})
 }
 
+func TestRaftImplCentralized(t *testing.T) {
+	defer leaktest.Check(t)()
+
+	for _, tc := range []struct {
+		bootstrap, members int
+		central            []int
+	}{
+		{1, 5, []int{1, 2, 3}},
+		{2, 100, []int{2, 3, 10}},
+	} {
+		tname := fmt.Sprintf("bootstrap=%d,members=%d,central=%v", tc.bootstrap, tc.members, tc.central)
+		t.Run(tname, func(t *testing.T) {
+			var cluster []Liveness
+			var bootstrapped Liveness
+			for i := 1; i <= tc.members; i++ {
+				var central []ID
+				for _, m := range tc.central {
+					central = append(central, ID(m))
+				}
+				opts := []Option{WithID(ID(i)), WithImpl("raft"), WithCentral(central...)}
+				if i == tc.bootstrap {
+					opts = append(opts, WithBootstrap())
+				}
+
+				l := Start(opts...)
+				defer l.Teardown()
+
+				cluster = append(cluster, l)
+				if i == tc.bootstrap {
+					bootstrapped = l
+				}
+			}
+
+			teardown := tick(t, cluster...)
+			defer teardown()
+
+			for _, l := range cluster {
+				if l.ID() == bootstrapped.ID() {
+					continue
+				}
+				assert.NoError(t, bootstrapped.Add(context.Background(), l.ID()))
+			}
+
+			// Check that the membership is what we expect, and visible from
+			// every node.
+			testutils.SucceedsSoon(t, func() error {
+				for _, l := range cluster {
+					members := l.Members()
+					if len(members) != tc.members {
+						return fmt.Errorf("expected # members (from id=%s) == %d; got %d",
+							l.ID(), tc.members, len(members))
+					}
+
+					for i, member := range members {
+						if member != cluster[i].ID() {
+							return fmt.Errorf("expected members[%d] == %s; got %s",
+								i, cluster[i].ID(), member)
+						}
+					}
+				}
+				return nil
+			})
+		})
+	}
+}
+
 func newNetwork() *network {
 	return &network{
 		ls:          make([]Liveness, 0),
@@ -635,9 +701,9 @@ func (n *network) restart(member ID) {
 	defer n.Unlock()
 
 	old := n.get(member)
-	old.Close()
+	old.Teardown()
 	impl := old.(*L).Liveness.(*raftImpl)
-	l := New(
+	l := Start(
 		WithID(member),
 		WithImpl("raft"),
 		WithStorage(impl.raft.storage),
@@ -715,7 +781,7 @@ func (n *network) tick(t *testing.T) (teardown func() error) {
 
 		n.Lock()
 		for _, l := range n.ls {
-			l.Close()
+			l.Teardown()
 		}
 		n.Unlock()
 		return nil
