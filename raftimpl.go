@@ -52,14 +52,15 @@ type raftImpl struct {
 
 	mu struct {
 		sync.Mutex
-		members                 map[ID]uint64 // member: ticker expiration
-		inbox                   []Message
-		outbox                  []Message
+		members       map[ID]uint64 // member: ticker expiration
+		inbox, outbox []Message
+
+		removedFromGroup        bool
 		readyToAcceptHeartbeats bool
-		closed                  bool
 		inflight                map[uint64]chan struct{}
 		raftReady               []raft.Ready
 		ticker                  uint64
+		closed                  bool
 	}
 
 	raft struct {
@@ -131,6 +132,12 @@ func (r *raftImpl) Members() []ID {
 func (r *raftImpl) Tick() {
 	r.mu.Lock()
 	defer r.mu.Unlock()
+
+	if r.mu.removedFromGroup {
+		// TODO(irfansharif): What's a better API to signal to the ticker thread
+		// that we're done, and should no longer be ticked?
+		return
+	}
 
 	// We trigger a heartbeat around the halfway point from when we last
 	// heartbeat, to when the heartbeat will no longer be valid.
@@ -367,7 +374,12 @@ func (r *raftImpl) applyEntryLocked(entry raftpb.Entry) error {
 		}
 	case remove:
 		delete(r.mu.members, proposal.Member)
-		r.log.Printf("removed l=%d", proposal.Member)
+		if proposal.Member == r.ID() {
+			r.mu.removedFromGroup = true
+			r.log.Printf("removed l=%d (self)", proposal.Member)
+		} else {
+			r.log.Printf("removed l=%d", proposal.Member)
+		}
 	}
 	return nil
 }

@@ -57,6 +57,22 @@ func TestRaftImplIllegalID(t *testing.T) {
 	})
 }
 
+// TestRaftImplIllegalCentral tests that we appropriately panic when
+// instantiating a liveness module to be bootstrapped, yet not including it in
+// the central group.
+func TestRaftImplIllegalCentral(t *testing.T) {
+	defer leaktest.Check(t)()
+
+	testutils.ShouldPanic(t, "bootstrap member 1 not found in central membership [liveness-id=2]", func() {
+		Start(
+			WithID(ID(1)),
+			WithImpl("raft"),
+			WithBootstrap(),
+			WithCentral(2),
+		)
+	})
+}
+
 // TestRaftImplMisroutedMessage asserts that misrouted liveness messages result
 // in panics.
 func TestRaftImplMisroutedMessage(t *testing.T) {
@@ -167,179 +183,18 @@ func TestRaftImplTick(t *testing.T) {
 	assert.Equal(t, l.Members()[0], ID(42))
 }
 
-// TestRaftImplSingleMembership tests basic invariants of a single-member
-// liveness cluster (the module ID, and view of cluster membership).
-func TestRaftImplSingleMembership(t *testing.T) {
+func TestRaftImplID(t *testing.T) {
 	defer leaktest.Check(t)()
 
-	n := newNetwork()
-	id := ID(1)
+	id := ID(42)
 	l := Start(
 		WithID(id),
 		WithImpl("raft"),
 		WithBootstrap(),
 	)
-	n.ls = append(n.ls, l)
 
 	// Sanity check our ID.
 	assert.Equal(t, id, l.ID())
-
-	teardown := n.tick(t)
-	defer teardown()
-
-	// Check that we appear as live to ourself.
-	testutils.SucceedsSoon(t, func() error {
-		live, found := l.Live(id)
-		if !found {
-			return fmt.Errorf("expected to find self")
-		}
-		if !live {
-			return fmt.Errorf("expected to find self as live")
-		}
-		return nil
-	})
-
-	// Check that the membership is what we expect.
-	testutils.SucceedsSoon(t, func() error {
-		members := l.Members()
-		if numMembers := len(members); numMembers != 1 {
-			return fmt.Errorf("expected # members == 1; got %d", numMembers)
-		}
-		if members[0] != id {
-			return fmt.Errorf("expected membership == [%d]; got %s", id, members)
-		}
-		return nil
-	})
-}
-
-// TestRaftImplMultipleAdd tests the construction of a multi-node cluster,
-// verifying a stable view of cluster membership across all nodes.
-func TestRaftImplMultipleAdd(t *testing.T) {
-	defer leaktest.Check(t)()
-
-	for _, tc := range []struct {
-		bootstrap, members int
-	}{
-		{1, 1},
-		{2, 2},
-		{3, 3},
-		{2, 5},
-		{7, 10},
-	} {
-		t.Run(fmt.Sprintf("bootstrap=%d,members=%d", tc.bootstrap, tc.members), func(t *testing.T) {
-			var cluster []Liveness
-			var bootstrapped Liveness
-			for i := 1; i <= tc.members; i++ {
-				opts := []Option{WithID(ID(i)), WithImpl("raft")}
-				if i == tc.bootstrap {
-					opts = append(opts, WithBootstrap())
-				}
-
-				l := Start(opts...)
-				defer l.Teardown()
-
-				cluster = append(cluster, l)
-				if i == tc.bootstrap {
-					bootstrapped = l
-				}
-			}
-
-			teardown := tick(t, cluster...)
-			defer teardown()
-
-			for _, l := range cluster {
-				if l.ID() == bootstrapped.ID() {
-					continue
-				}
-				assert.NoError(t, bootstrapped.Add(context.Background(), l.ID()))
-			}
-
-			// Check that the membership is what we expect, and visible from
-			// every node.
-			testutils.SucceedsSoon(t, func() error {
-				for _, l := range cluster {
-					members := l.Members()
-					if len(members) != tc.members {
-						return fmt.Errorf("expected # members (from id=%s) == %d; got %d",
-							l.ID(), tc.members, len(members))
-					}
-
-					for i, member := range members {
-						if member != cluster[i].ID() {
-							return fmt.Errorf("expected members[%d] == %s; got %s",
-								i, cluster[i].ID(), member)
-						}
-					}
-				}
-				return nil
-			})
-		})
-	}
-}
-
-// TestRaftImplMultipleReplive tests the deconstruction of a multi-node cluster,
-// verifying a stable view of cluster membership across all nodes.
-func TestRaftImplMultipleRemove(t *testing.T) {
-	defer leaktest.Check(t)()
-
-	for _, tc := range []struct {
-		initial, remaining int
-	}{
-		{5, 2},
-		{5, 1},
-		{3, 2},
-		{3, 3},
-		{7, 4},
-	} {
-		t.Run(fmt.Sprintf("initial=%d,remaining=%d", tc.initial, tc.remaining), func(t *testing.T) {
-			var cluster []Liveness
-			for i := 1; i <= tc.initial; i++ {
-				opts := []Option{WithID(ID(i)), WithImpl("raft")}
-				if i == 1 {
-					opts = append(opts, WithBootstrap())
-				}
-
-				l := Start(opts...)
-				defer l.Teardown()
-
-				cluster = append(cluster, l)
-			}
-
-			l1 := cluster[0]
-			teardown := tick(t, cluster...)
-			defer teardown()
-
-			// Add a bunch of nodes, and then size down again back to the remaining
-			// members.
-			for _, l := range cluster[1:] {
-				assert.NoError(t, l1.Add(context.Background(), l.ID()))
-			}
-
-			for _, l := range cluster[tc.remaining:] {
-				assert.NoError(t, l1.Remove(context.Background(), l.ID()))
-			}
-
-			// Check that the membership is what we expect (nothing but the remaining
-			// members, visible only from the remaining ones).
-			testutils.SucceedsSoon(t, func() error {
-				for _, l := range cluster[:tc.remaining] {
-					members := l.Members()
-					if len(members) != tc.remaining {
-						return fmt.Errorf("expected # members (from id=%s) == %d; got %d %s",
-							l1.ID(), tc.remaining, len(members), members)
-					}
-				}
-
-				for _, l := range cluster[tc.remaining:] {
-					members := l.Members()
-					if len(members) != 0 {
-						return fmt.Errorf("expected # members (from id=%s) == 0; got %d %s", l.ID(), len(members), members)
-					}
-				}
-				return nil
-			})
-		})
-	}
 }
 
 func TestRaftImplPartitionedNode(t *testing.T) {

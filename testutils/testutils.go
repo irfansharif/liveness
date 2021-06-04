@@ -37,7 +37,7 @@ import (
 
 // defaultSucceedsSoonDuration is the maximum amount of time unittests
 // will wait for a condition to become true. See SucceedsSoon().
-const defaultSucceedsSoonDuration = 5 * time.Second
+const defaultSucceedsSoonDuration = 1 * time.Second
 
 // SucceedsSoon fails the test (with t.Fatal) unless the supplied
 // function runs without error within a preset maximum duration. The

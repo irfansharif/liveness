@@ -82,7 +82,7 @@ type Liveness interface {
 type ID uint64
 
 func (id ID) String() string {
-	return fmt.Sprintf("liveness-id=%d", id)
+	return fmt.Sprintf("%d", id)
 }
 
 // Storage is the medium through which a given liveness module interfaces with
@@ -178,6 +178,13 @@ func WithStorage(storage Storage) Option {
 	}
 }
 
+// WithCentral configures the liveness module to maintain a consensus group only
+// among the specified members.
+//
+// TODO(irfansharif): When used as a library, it'd be more usable if we could
+// specify a group size here instead. We'd add the first N members as part of
+// the consensus group, and the remaining as learners. When one of the N members
+// is removed, we could transparently promote a learner if one was available.
 func WithCentral(members ...ID) Option {
 	return func(l *L) {
 		central := make(map[ID]struct{})
