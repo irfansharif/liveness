@@ -110,6 +110,11 @@ func (r *raftImpl) liveInternal(member ID) (live, found bool) {
 	return r.mu.ticker < exp, found
 }
 
+func (r *raftImpl) liveLocked(member ID) (live, found bool) {
+	exp, found := r.mu.members[member]
+	return r.mu.ticker < exp, found
+}
+
 // Members is part of the Liveness interface.
 func (r *raftImpl) Members() []ID {
 	r.mu.Lock()
@@ -154,6 +159,10 @@ func (r *raftImpl) Tick() {
 	// Step through all received messages.
 	for _, msg := range r.mu.inbox {
 		raftmsg := msg.Content.(raftpb.Message)
+		if raftmsg.Type == raftpb.MsgProp && r.raft.node.Status().Lead != r.raft.node.Status().ID {
+			r.log.Printf("received a forwarded proposal but no longer a leader, skipping")
+			continue
+		}
 		if err := r.raft.node.Step(context.Background(), raftmsg); err != nil {
 			r.log.Fatal(err)
 		}
@@ -310,8 +319,9 @@ const remove operation = "remove"
 const heartbeat operation = "heartbeat"
 
 type proposal struct {
-	Op     operation
-	Member ID
+	Op       operation
+	Metadata string
+	Member   ID
 }
 
 func (r *raftImpl) applyEntryLocked(entry raftpb.Entry) error {
@@ -354,23 +364,38 @@ func (r *raftImpl) applyEntryLocked(entry raftpb.Entry) error {
 		// 	a. through regular raft replication, while we're live and healthy
 		// 	b. when restarting a node, and reapplying previous entries
 		//
-		// Computing the heartbeat extension ticker count during (a) is fine, but
-		// during (b) is nonsensical. What's to be done? Ideally we'd be able to
-		// distinguish and not apply any heartbeat requests from before we were
-		// started up. We want to only rely on the subsequent heartbeat from all
-		// peers to ascertain health status. Unfortunately etcd doesn't expose
-		// an API for us to ascertain which log records are being read off
-		// stable storage, and which ones are being received live.
+		// Computing the heartbeat extension ticker count during (a) is fine[*],
+		// but during (b) is nonsensical. What's to be done? Ideally we'd be
+		// able to distinguish and not apply any heartbeat requests from before
+		// we were started up. We want to only rely on the subsequent heartbeat
+		// from all peers to ascertain health status. Unfortunately etcd doesn't
+		// expose an API for us to ascertain which log records are being read
+		// off stable storage, and which ones are being received live.
 		//
 		// To work around this, we submit a linearizable read-only request
 		// through raft during startup, and wait for it to be received back here
 		// before applying any heartbeat proposals. This has the effect of
 		// filtering out all earlier heartbeat proposals.
+		//
+		// [*] We do have to be careful around applying heartbeats from when we
+		// weren't live and healthy. Consider a network partition that later
+		// heals. Minority partition nodes will then catch up to heartbeats from
+		// the majority side, heartbeats from nodes that may have later been
+		// removed (we'll learn about these too soon, as part of the same
+		// catch-up). Because there's no semblance of real time associated with
+		// these heartbeats, how do we distinguish between stale heartbeats and
+		// current ones? For this reason, we don't apply heartbeats from other
+		// nodes if we ourselves are not live. We'll not apply the same
+		// treatment for our own heartbeats of course, lest a partitioned node
+		// never recover liveness according to itself.
 
-		if r.mu.readyToAcceptHeartbeats {
+		if live, _ := r.liveLocked(r.ID()); r.mu.readyToAcceptHeartbeats && (live || proposal.Member == r.ID()) {
 			r.mu.members[proposal.Member] = r.mu.ticker + heartbeatIncrement
-			r.log.Printf("received heartbeat for l=%d (at t=%d, valid until t=%d)",
-				proposal.Member, r.mu.ticker, r.mu.ticker+heartbeatIncrement)
+
+			if proposal.Member != r.ID() {
+				r.log.Printf("received heartbeat for l=%d (at t=%d, valid until t=%d; originally sent at t=%s)",
+					proposal.Member, r.mu.ticker, r.mu.ticker+heartbeatIncrement, proposal.Metadata)
+			}
 		}
 	case remove:
 		delete(r.mu.members, proposal.Member)
@@ -413,8 +438,13 @@ func (r *raftImpl) runHeartbeatLoop() {
 				continue
 			}
 
+			r.mu.Lock()
+			t := r.mu.ticker
+			r.mu.Unlock()
+
+			r.log.Printf("sending heartbeat for l=%s (at t=%d, valid until t=%d)", r.ID(), t, t+heartbeatIncrement)
 			ctx := context.Background()
-			err := r.proposeWithRetry(ctx, proposal{Op: heartbeat, Member: r.ID()})
+			err := r.proposeWithRetry(ctx, proposal{Op: heartbeat, Member: r.ID(), Metadata: fmt.Sprint(t)})
 			if err != nil && err != raft.ErrStopped { // we could've been closed in the interim
 				r.log.Fatal(err)
 			}

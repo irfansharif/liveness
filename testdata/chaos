@@ -1,0 +1,52 @@
+# Check that a downed node appears as such to other nodes in the cluster,
+# without losing membership. Also check that when restarted, it re-appears as
+# live.
+liveness impl=raft nodes=3 bootstrap=1
+1.add(2, 3)
+1-3.members()       # members:[1, 2, 3]
+1-3.live(1-3)       # live:true, found:true
+2.stop()
+1-3.members()       # members:[1, 2, 3]
+1,3.live(1,3)       # live:true, found:true
+1,3.live(2)         # live:false, found:true
+2.start()
+1-3.members()       # members:[1, 2, 3]
+1-3.live(1-3)       # live:true, found:true
+----
+ok
+
+# Check that nodes in a minority partition appear as non-live to all nodes in
+# the cluster (including themselves). When each node in the minority partition
+# is re-partitioned to be in the majority, they should re-appear as healthy.
+liveness impl=raft nodes=5 bootstrap=1
+1.add(2-5)
+1-5.members()       # members:[1, 2, 3, 4, 5]
+1-5.live(1-5)       # live:true, found:true
+nw.partition([1-3], [4,5])
+1-5.members()       # members:[1, 2, 3, 4, 5]
+1-3.live(4,5)       # live:false, found:true
+4,5.live(4,5)       # live:false, found:true
+nw.partition([1-4], [5])
+1-4.live(4)         # live:true, found:true
+1-4.live(5)         # live:false, found:true
+nw.partition([1-5])
+1-5.members()       # members:[1, 2, 3, 4, 5]
+1-5.live(1-5)       # live:true, found:true
+----
+ok
+
+# Check that nodes in a minority partition appear as non-live to all nodes in
+# the cluster (including themselves). When the partition heals, nodes should
+# re-appear as healthy.
+liveness impl=raft nodes=3 bootstrap=1
+1.add(2,3)
+1-3.members()       # members:[1, 2, 3]
+1-3.live(1-3)       # live:true, found:true
+nw.partition([1,2], [3])
+1-3.members()       # members:[1, 2, 3]
+1-2.live(3)         # live:false, found:true
+3.live(3)           # live:false, found:true
+nw.heal()
+1-3.live(3)         # live:true, found:true
+----
+ok

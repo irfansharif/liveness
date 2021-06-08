@@ -30,14 +30,13 @@ package testutils
 import (
 	"fmt"
 	"log"
-	"runtime/debug"
 	"testing"
 	"time"
 )
 
 // defaultSucceedsSoonDuration is the maximum amount of time unittests
 // will wait for a condition to become true. See SucceedsSoon().
-const defaultSucceedsSoonDuration = 1 * time.Second
+const defaultSucceedsSoonDuration = 3 * time.Second
 
 // SucceedsSoon fails the test (with t.Fatal) unless the supplied
 // function runs without error within a preset maximum duration. The
@@ -46,8 +45,8 @@ const defaultSucceedsSoonDuration = 1 * time.Second
 func SucceedsSoon(t testing.TB, fn func() error) {
 	t.Helper()
 	if err := succeedsSoonError(fn); err != nil {
-		t.Fatalf("condition failed to evaluate within %s: %s\n%s",
-			defaultSucceedsSoonDuration, err, string(debug.Stack()))
+		t.Fatalf("condition failed to evaluate within %s: %s",
+			defaultSucceedsSoonDuration, err)
 	}
 }
 

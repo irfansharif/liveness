@@ -19,7 +19,6 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
-	"sync"
 	"testing"
 	"time"
 
@@ -228,7 +227,7 @@ func TestRaftImplPartitionedNode(t *testing.T) {
 		assert.NoError(t, bootstrapped.Add(context.Background(), l.ID()))
 	}
 
-	n.partition(downMember)
+	n.partitionDeprecated(downMember)
 	testutils.SucceedsSoon(t, func() error {
 		for _, l := range n.ls {
 			live, found := l.Live(downMember)
@@ -242,7 +241,7 @@ func TestRaftImplPartitionedNode(t *testing.T) {
 		return nil
 	})
 
-	n.heal(downMember)
+	n.healDeprecated(downMember)
 	testutils.SucceedsSoon(t, func() error {
 		for _, l := range n.ls {
 			live, found := l.Live(downMember)
@@ -517,129 +516,6 @@ func TestRaftImplCentralized(t *testing.T) {
 				return nil
 			})
 		})
-	}
-}
-
-func newNetwork() *network {
-	return &network{
-		ls:          make([]Liveness, 0),
-		partitioned: make(map[ID]struct{}),
-		stopped:     make(map[ID]struct{}),
-	}
-}
-
-type network struct {
-	sync.Mutex
-	ls []Liveness
-
-	partitioned map[ID]struct{}
-	stopped     map[ID]struct{}
-}
-
-func (n *network) get(member ID) Liveness {
-	return n.ls[int(member)-1]
-}
-
-func (n *network) set(member ID, l Liveness) {
-	n.ls[int(member)-1] = l
-}
-
-func (n *network) stop(member ID) {
-	n.Lock()
-	defer n.Unlock()
-
-	n.stopped[member] = struct{}{}
-}
-
-func (n *network) restart(member ID) {
-	n.Lock()
-	defer n.Unlock()
-
-	old := n.get(member)
-	old.Teardown()
-	impl := old.(*L).Liveness.(*raftImpl)
-	l := Start(
-		WithID(member),
-		WithImpl("raft"),
-		WithStorage(impl.raft.storage),
-	)
-	n.set(member, l)
-
-	delete(n.stopped, member)
-}
-
-func (n *network) partition(member ID) {
-	n.Lock()
-	defer n.Unlock()
-
-	n.partitioned[member] = struct{}{}
-}
-
-func (n *network) heal(member ID) {
-	n.Lock()
-	defer n.Unlock()
-
-	delete(n.partitioned, member)
-}
-
-func (n *network) tick(t *testing.T) (teardown func() error) {
-	for i, l := range n.ls {
-		if got, exp := l.ID(), ID(i+1); got != exp {
-			t.Fatalf("malformed cluster list; expected ls[%d]:%s got %s", i, exp, got)
-		}
-	}
-
-	// Set up the liveness tickers + message delivery service in a separate
-	// thread.
-	ctx, cancel := context.WithCancel(context.Background())
-	g, ctx := errgroup.WithContext(ctx)
-	g.Go(func() error {
-		for {
-			select {
-			case <-ctx.Done():
-				return ctx.Err()
-			default:
-			}
-
-			n.Lock()
-			for _, l := range n.ls {
-				if _, ok := n.partitioned[l.ID()]; ok {
-					continue // don't bother processing the outbox
-				}
-
-				for _, msg := range l.Outbox() {
-					if _, ok := n.partitioned[msg.To]; ok {
-						continue // don't bother delivering to it
-					}
-
-					n.ls[msg.To-1].Inbox(msg)
-				}
-			}
-			n.Unlock()
-
-			for _, l := range n.ls {
-				if _, ok := n.stopped[l.ID()]; ok {
-					continue // don't bother ticking this node
-				}
-				l.Tick()
-			}
-
-			time.Sleep(10 * time.Millisecond)
-		}
-	})
-
-	return func() error {
-		cancel()
-		if err := g.Wait(); err != nil && err != context.Canceled {
-			return err
-		}
-
-		n.Lock()
-		for _, l := range n.ls {
-			l.Teardown()
-		}
-		n.Unlock()
-		return nil
 	}
 }
 
